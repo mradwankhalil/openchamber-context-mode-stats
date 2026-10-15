@@ -3,8 +3,12 @@
  *
  * Reads the per-process stats files context-mode persists
  * (`<config>/opencode/context-mode/sessions/stats-pid-*.json`) and produces
- * the panel payload: the live process, all-time totals, a daily savings
- * series and per-tool breakdowns.
+ * the panel payload: the live process, an aggregate over a selectable scope
+ * (all time / single process / day range), a daily savings series and
+ * per-tool breakdowns.
+ *
+ * Dollar figures come from service/pricing.ts (models.dev rates weighted by
+ * the user's real model mix), never from context-mode's flat estimate.
  *
  * Persisted files are untrusted JSON: every field is validated and malformed
  * files are skipped, never thrown.
@@ -13,6 +17,8 @@
 import * as fs from "node:fs/promises"
 import * as os from "node:os"
 import * as path from "node:path"
+import { PricingEngine } from "./pricing"
+import type { PricingResult } from "./pricing"
 
 // ------------------------------------------------------------------ types
 
@@ -37,11 +43,18 @@ export interface LiveProcess {
     totalProcessed: number
     reductionPct: number
     tokensSaved: number
-    dollarsSaved: number
     tools: ToolStat[]
 }
 
-export interface AllTime {
+export interface ProcessSummary {
+    pid: string
+    startedAt: number
+    updatedAt: number
+    totalCalls: number
+    tokensSaved: number
+}
+
+export interface Aggregate {
     processes: number
     totalCalls: number
     bytesReturned: number
@@ -52,7 +65,6 @@ export interface AllTime {
     keptOut: number
     totalProcessed: number
     tokensSaved: number
-    dollarsSaved: number
     tools: ToolStat[]
 }
 
@@ -60,10 +72,24 @@ export interface DayPoint {
     /** YYYY-MM-DD (local) */
     day: string
     tokensSaved: number
-    dollarsSaved: number
     calls: number
     bytesProcessed: number
     sessions: number
+}
+
+/** Scope selector for the aggregate section. */
+export interface Scope {
+    /** single process pid */
+    pid?: string
+    /** YYYY-MM-DD, inclusive, local time */
+    from?: string
+    /** YYYY-MM-DD, inclusive, local time */
+    to?: string
+}
+
+export interface ScopeEcho {
+    kind: "all" | "process" | "range"
+    label: string
 }
 
 export interface StatsPayload {
@@ -76,7 +102,13 @@ export interface StatsPayload {
     reason?: "storage-missing"
     live: LiveProcess | null
     liveStale: boolean
-    allTime: AllTime | null
+    /** Aggregate over the requested scope (all time when no scope given). */
+    scoped: Aggregate | null
+    scope: ScopeEcho
+    /** Pricing for the scoped tokensSaved; null when not computable. */
+    pricing: PricingResult | null
+    /** Every known process, newest first — feeds the scope picker. */
+    processes: ProcessSummary[]
     daily: DayPoint[]
 }
 
@@ -130,7 +162,6 @@ interface StatsFile {
     totalProcessed: number
     reductionPct: number
     tokensSaved: number
-    dollarsSaved: number
     tools: ToolStat[]
 }
 
@@ -144,24 +175,21 @@ function parseStatsFile(pid: string, raw: unknown): StatsFile | null {
         }
         tools.sort((a, b) => b.bytes - a.bytes)
     }
-    const totalCalls = num(raw.total_calls)
-    const totalProcessed = num(raw.total_processed)
     return {
         pid,
         sessionStart: num(raw.session_start),
         updatedAt: num(raw.updated_at),
         uptimeMs: num(raw.uptime_ms),
-        totalCalls,
+        totalCalls: num(raw.total_calls),
         bytesReturned: num(raw.bytes_returned),
         bytesIndexed: num(raw.bytes_indexed),
         bytesSandboxed: num(raw.bytes_sandboxed),
         cacheHits: num(raw.cache_hits),
         cacheBytesSaved: num(raw.cache_bytes_saved),
         keptOut: num(raw.kept_out),
-        totalProcessed,
+        totalProcessed: num(raw.total_processed),
         reductionPct: num(raw.reduction_pct),
         tokensSaved: num(raw.tokens_saved),
-        dollarsSaved: num(raw.dollars_saved_session),
         tools,
     }
 }
@@ -174,15 +202,25 @@ function dayKey(timestamp: number): string {
     return `${y}-${m}-${day}`
 }
 
+/** Start-of-day ms for a YYYY-MM-DD string in local time; null if invalid. */
+function dayStartMs(day: string): number | null {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day)
+    if (!match) return null
+    const ms = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3])).getTime()
+    return Number.isFinite(ms) ? ms : null
+}
+
 // ------------------------------------------------------------------ store
 
 const LIVE_WINDOW_MS = 60_000
 
 export class StatsStore {
     readonly storageDirs: string[]
+    private readonly pricing: PricingEngine
 
-    constructor(storageDirs: string[]) {
+    constructor(storageDirs: string[], pricing?: PricingEngine) {
         this.storageDirs = storageDirs
+        this.pricing = pricing ?? new PricingEngine()
     }
 
     /** Primary dir — filled in after each scan with the freshest store. */
@@ -229,7 +267,47 @@ export class StatsStore {
         return [...byKey.values()]
     }
 
-    async getStats(): Promise<StatsPayload> {
+    private aggregate(files: StatsFile[]): Aggregate | null {
+        if (files.length === 0) return null
+        const toolMap = new Map<string, ToolStat>()
+        const acc: Aggregate = {
+            processes: files.length,
+            totalCalls: 0,
+            bytesReturned: 0,
+            bytesIndexed: 0,
+            bytesSandboxed: 0,
+            cacheHits: 0,
+            cacheBytesSaved: 0,
+            keptOut: 0,
+            totalProcessed: 0,
+            tokensSaved: 0,
+            tools: [],
+        }
+        for (const f of files) {
+            acc.totalCalls += f.totalCalls
+            acc.bytesReturned += f.bytesReturned
+            acc.bytesIndexed += f.bytesIndexed
+            acc.bytesSandboxed += f.bytesSandboxed
+            acc.cacheHits += f.cacheHits
+            acc.cacheBytesSaved += f.cacheBytesSaved
+            acc.keptOut += f.keptOut
+            acc.totalProcessed += f.totalProcessed
+            acc.tokensSaved += f.tokensSaved
+            for (const t of f.tools) {
+                const existing = toolMap.get(t.name)
+                if (existing) {
+                    existing.calls += t.calls
+                    existing.bytes += t.bytes
+                } else {
+                    toolMap.set(t.name, { name: t.name, calls: t.calls, bytes: t.bytes })
+                }
+            }
+        }
+        acc.tools = [...toolMap.values()].sort((a, b) => b.bytes - a.bytes)
+        return acc
+    }
+
+    async getStats(scope: Scope = {}): Promise<StatsPayload> {
         const generatedAt = Date.now()
         const files = await this.readAll()
         if (files === null) {
@@ -241,7 +319,10 @@ export class StatsStore {
                 reason: "storage-missing",
                 live: null,
                 liveStale: false,
-                allTime: null,
+                scoped: null,
+                scope: { kind: "all", label: "All time" },
+                pricing: null,
+                processes: [],
                 daily: [],
             }
         }
@@ -268,69 +349,80 @@ export class StatsStore {
                 totalProcessed: newest.totalProcessed,
                 reductionPct: newest.reductionPct,
                 tokensSaved: newest.tokensSaved,
-                dollarsSaved: newest.dollarsSaved,
                 tools: newest.tools,
             }
         }
 
-        // ---- all-time aggregate
-        let allTime: AllTime | null = null
-        if (files.length > 0) {
-            const toolMap = new Map<string, ToolStat>()
-            const acc: AllTime = {
-                processes: files.length,
-                totalCalls: 0,
-                bytesReturned: 0,
-                bytesIndexed: 0,
-                bytesSandboxed: 0,
-                cacheHits: 0,
-                cacheBytesSaved: 0,
-                keptOut: 0,
-                totalProcessed: 0,
-                tokensSaved: 0,
-                dollarsSaved: 0,
-                tools: [],
+        // ---- process picker list (newest first)
+        const processes: ProcessSummary[] = sorted.map((f) => ({
+            pid: f.pid,
+            startedAt: f.sessionStart,
+            updatedAt: f.updatedAt,
+            totalCalls: f.totalCalls,
+            tokensSaved: f.tokensSaved,
+        }))
+
+        // ---- scope resolution
+        let scopedFiles = files
+        let scopeEcho: ScopeEcho = { kind: "all", label: "All time" }
+        let windowStart = 0
+        let windowEnd = generatedAt
+
+        if (scope.pid) {
+            scopedFiles = files.filter((f) => f.pid === scope.pid)
+            const p = scopedFiles[0]
+            scopeEcho = {
+                kind: "process",
+                label: p ? `Process ${p.pid}` : `Process ${scope.pid} (not found)`,
             }
-            for (const f of files) {
-                acc.totalCalls += f.totalCalls
-                acc.bytesReturned += f.bytesReturned
-                acc.bytesIndexed += f.bytesIndexed
-                acc.bytesSandboxed += f.bytesSandboxed
-                acc.cacheHits += f.cacheHits
-                acc.cacheBytesSaved += f.cacheBytesSaved
-                acc.keptOut += f.keptOut
-                acc.totalProcessed += f.totalProcessed
-                acc.tokensSaved += f.tokensSaved
-                acc.dollarsSaved += f.dollarsSaved
-                for (const t of f.tools) {
-                    const existing = toolMap.get(t.name)
-                    if (existing) {
-                        existing.calls += t.calls
-                        existing.bytes += t.bytes
-                    } else {
-                        toolMap.set(t.name, { name: t.name, calls: t.calls, bytes: t.bytes })
-                    }
-                }
+            if (p) {
+                windowStart = p.sessionStart
+                windowEnd = p.updatedAt > p.sessionStart ? p.updatedAt : generatedAt
             }
-            acc.tools = [...toolMap.values()].sort((a, b) => b.bytes - a.bytes)
-            allTime = acc
+        } else if (scope.from || scope.to) {
+            const fromMs = scope.from ? dayStartMs(scope.from) : null
+            const toMs = scope.to ? dayStartMs(scope.to) : null
+            const startMs = fromMs ?? 0
+            const endMs = toMs !== null ? toMs + 86_399_999 : generatedAt
+            scopedFiles = files.filter(
+                (f) => f.sessionStart >= startMs && f.sessionStart <= endMs,
+            )
+            scopeEcho = {
+                kind: "range",
+                label:
+                    scope.from && scope.to
+                        ? `${scope.from} → ${scope.to}`
+                        : scope.from
+                          ? `Since ${scope.from}`
+                          : `Until ${scope.to}`,
+            }
+            windowStart = startMs
+            windowEnd = endMs
+        } else {
+            const starts = files.map((f) => f.sessionStart).filter((s) => s > 0)
+            windowStart = starts.length > 0 ? Math.min(...starts) : 0
         }
 
-        // ---- daily series (bucket by session start day)
+        const scoped = this.aggregate(scopedFiles)
+
+        // ---- pricing for the scoped savings
+        const pricing = scoped
+            ? await this.pricing.price(windowStart, windowEnd, scoped.tokensSaved)
+            : null
+
+        // ---- daily series (bucket by session start day; respects range scope)
         const dayMap = new Map<string, DayPoint>()
-        for (const f of files) {
+        for (const f of scopedFiles) {
             if (f.sessionStart <= 0) continue
             const key = dayKey(f.sessionStart)
             const point = dayMap.get(key) ?? {
                 day: key,
                 tokensSaved: 0,
-                dollarsSaved: 0,
                 calls: 0,
                 bytesProcessed: 0,
                 sessions: 0,
             }
             point.tokensSaved += f.tokensSaved
-            point.dollarsSaved += f.dollarsSaved
             point.calls += f.totalCalls
             point.bytesProcessed += f.totalProcessed
             point.sessions += 1
@@ -345,7 +437,10 @@ export class StatsStore {
             generatedAt,
             live,
             liveStale,
-            allTime,
+            scoped,
+            scope: scopeEcho,
+            pricing,
+            processes,
             daily,
         }
     }

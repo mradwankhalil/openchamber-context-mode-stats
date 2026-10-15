@@ -2,16 +2,16 @@
 
 An OpenChamber extension that shows what
 [context-mode](https://www.npmjs.com/package/context-mode) is saving you: the
-live process stats, all-time totals, per-tool breakdowns and a daily savings
-series — in the extensions rail panel and in the chat's Work Status panel.
+live process stats, scoped totals (all time / single process / day range),
+per-tool breakdowns and a daily savings series — in the extensions rail panel
+and in the chat's Work Status panel.
 
 ```
-Live process                          All-time
+Live process                          Aggregate  [All time | Today | 7d | 30d | process…]
 ──────────────────────────            ──────────────────────────
 Tokens saved     ~310K                Tokens saved     ~21.6B
-Est. $ saved     $1.55                Est. $ saved     $108,272
-Kept out         1.1 MB (66%)         Kept out         76.2 GB
-Tool calls       170                  Tool calls       13,239
+Kept out         1.1 MB (66%)         Est. value       $2,570 – $40,970
+Tool calls       170                  Model mix        deepseek-v4.1-flash 44%, …
 [donut: kept out vs returned]         [donut + top tools bar chart]
 
 Tokens saved per day
@@ -25,6 +25,30 @@ The per-process stats files context-mode writes to
 store location is scanned (XDG config home, `~/.config`, `.opencode-v2`) and
 files are deduped by pid + session start, so mirror stores never double-count.
 To pin one directory, set `CONTEXT_MODE_STATS_DIR` for the service.
+
+## Scope selector
+
+The aggregate section header is a picker: **All time**, **Today**, **Last 7
+days**, **Last 30 days**, or any individual context-mode process. Metrics,
+donut, tool bars and the daily series all follow the selection.
+
+## How dollar figures are computed
+
+context-mode's own flat $5/1M estimate is **not** shown. Instead the service
+prices saved tokens at your models' real rates:
+
+- **Model mix** — OpenCode's `opencode.db` (opened read-only) records every
+  session's model and token usage; the mix for the selected window is weighted
+  by input-side tokens (input + cache read), because kept-out bytes would have
+  been prompt tokens.
+- **Rates** — [models.dev](https://models.dev) `api.json`, cached on disk for
+  24 h at `~/.config/openchamber/context-mode-stats-pricing.json`.
+
+Saved tokens are prompt-side, so the value is a range: the lower bound prices
+every saved token at cache-read rates, the upper bound at full input rates.
+Hover the figure for the basis and rate coverage. If the database is missing
+or no model matches a rate, dollar rows are simply omitted. Set
+`OPENCODE_DB_PATH` to point at a specific database file.
 
 ## Install
 

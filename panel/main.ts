@@ -8,13 +8,25 @@
  * The page is a thin view. The extension's local service reads the
  * context-mode stats files and returns the numbers; this file only renders
  * them. Charts are hand-rolled SVG/divs — no dependencies.
+ *
+ * Dollar figures come from the service's pricing engine (models.dev rates
+ * weighted by the user's real model mix) and are shown as a range:
+ * min = cache-read rates, max = full input rates.
  */
 
 import { connectHost, HostRequestError } from "@openchamber/sdk"
 import type { HostReadyContext } from "@openchamber/sdk"
 import { applyHostReady, mountBanner, mountButton } from "@openchamber/sdk/ui"
 import type { BannerHandle, ButtonHandle } from "@openchamber/sdk/ui"
-import type { AllTime, DayPoint, LiveProcess, StatsPayload, ToolStat } from "../service/stats"
+import type {
+    Aggregate,
+    DayPoint,
+    LiveProcess,
+    ProcessSummary,
+    StatsPayload,
+    ToolStat,
+} from "../service/stats"
+import type { PricingResult } from "../service/pricing"
 
 const POLL_MS = 4000
 const DAILY_WINDOW = 30
@@ -37,6 +49,14 @@ type MetricRow = {
     label: string
     value: string
     tone?: "success"
+    title?: string
+}
+
+/** Current scope selection. pid set → single process; else optional range. */
+type ScopeSelection = {
+    pid?: string
+    from?: string
+    to?: string
 }
 
 let mounted = false
@@ -46,6 +66,8 @@ let notice: Notice | null = null
 let pollTimer: number | null = null
 let fetchSeq = 0
 let lastStatusHeight = -1
+let selection: ScopeSelection = {}
+let selectValue = "all"
 
 let refs: {
     subtitle: HTMLElement
@@ -55,9 +77,13 @@ let refs: {
     liveDonut: HTMLElement
     liveTools: HTMLElement
     liveHint: HTMLElement
-    allTimeMetrics: HTMLElement
-    allTimeDonut: HTMLElement
-    allTimeTools: HTMLElement
+    scopeSelect: HTMLSelectElement
+    scopeSection: HTMLElement
+    scopeHeaderLabel: HTMLElement
+    scopeMeta: HTMLElement
+    scopeMetrics: HTMLElement
+    scopeDonut: HTMLElement
+    scopeTools: HTMLElement
     dailyChart: HTMLElement
     dailyMeta: HTMLElement
     refresh: ButtonHandle
@@ -126,9 +152,7 @@ function donut(
             arc.setAttribute("stroke-dasharray", `${frac * circumference} ${circumference}`)
             arc.setAttribute("stroke-dashoffset", String(-offset * circumference))
             arc.setAttribute("transform", `rotate(-90 ${size / 2} ${size / 2})`)
-            const title = document.createElementNS(svgNS, "title")
-            title.textContent = `${seg.label}: ${(frac * 100).toFixed(1)}%`
-            arc.appendChild(title)
+            arc.appendChild(svgTitle(arc, `${seg.label}: ${(frac * 100).toFixed(1)}%`))
             svg.appendChild(arc)
             offset += frac
         }
@@ -151,6 +175,13 @@ function donut(
     return svg
 }
 
+function svgTitle(parent: SVGElement, text: string): SVGElement {
+    const title = document.createElementNS("http://www.w3.org/2000/svg", "title")
+    title.textContent = text
+    parent.appendChild(title)
+    return parent
+}
+
 function donutLegend(
     segments: { label: string; value: number; className: string }[],
     format: (value: number) => string,
@@ -168,7 +199,7 @@ function donutLegend(
     return legend
 }
 
-/** Horizontal bar list for ranked data (per-tool/per-command). */
+/** Horizontal bar list for ranked data (per-tool). */
 function hbarChart(
     rows: { label: string; value: number; display: string }[],
 ): HTMLElement {
@@ -221,7 +252,6 @@ function columnChart(points: DayPoint[]): HTMLElement {
         svg.appendChild(rect)
     })
 
-    // x-axis labels: first, middle, last day (MM-DD)
     const labelIndices = [...new Set([0, Math.floor((shown.length - 1) / 2), shown.length - 1])]
     for (const i of labelIndices) {
         const point = shown[i]
@@ -240,13 +270,14 @@ function columnChart(points: DayPoint[]): HTMLElement {
 
 // -------------------------------------------------------------------- mounting
 
-function section(title: string): { sectionEl: HTMLElement; meta: HTMLElement } {
+function section(title: string): { sectionEl: HTMLElement; meta: HTMLElement; label: HTMLElement } {
     const sectionEl = el("section", "cm-section")
     const header = el("div", "cm-section-header")
+    const label = el("span", undefined, title)
     const meta = el("span", "cm-section-meta", "")
-    header.append(el("span", undefined, title), meta)
+    header.append(label, meta)
     sectionEl.appendChild(header)
-    return { sectionEl, meta }
+    return { sectionEl, meta, label }
 }
 
 function mountPanel(): void {
@@ -277,19 +308,26 @@ function mountPanel(): void {
     const liveHint = el("div", "cm-hint")
     live.sectionEl.append(liveMetrics, liveDonut, liveTools, liveHint)
 
-    // All-time
-    const allTime = section("All-time")
-    const allTimeMetrics = el("div", "cm-metrics")
-    const allTimeDonut = el("div", "cm-chart")
-    const allTimeTools = el("div", "cm-subsection")
-    allTime.sectionEl.append(allTimeMetrics, allTimeDonut, allTimeTools)
+    // Scoped aggregate
+    const scoped = section("All time")
+    const scopeSelect = document.createElement("select")
+    scopeSelect.className = "cm-scope-select"
+    scopeSelect.addEventListener("change", () => {
+        applyScopeValue(scopeSelect.value)
+        void refreshStats()
+    })
+    scoped.label.replaceChildren(scopeSelect)
+    const scopeMetrics = el("div", "cm-metrics")
+    const scopeDonut = el("div", "cm-chart")
+    const scopeTools = el("div", "cm-subsection")
+    scoped.sectionEl.append(scopeMetrics, scopeDonut, scopeTools)
 
     // Daily series
     const daily = section("Tokens saved per day")
     const dailyChart = el("div", "cm-chart")
     daily.sectionEl.appendChild(dailyChart)
 
-    body.append(live.sectionEl, allTime.sectionEl, daily.sectionEl)
+    body.append(live.sectionEl, scoped.sectionEl, daily.sectionEl)
     panel.append(header, noticeEl, body)
     root.replaceChildren(panel)
 
@@ -301,13 +339,85 @@ function mountPanel(): void {
         liveDonut,
         liveTools,
         liveHint,
-        allTimeMetrics,
-        allTimeDonut,
-        allTimeTools,
+        scopeSelect,
+        scopeSection: scoped.sectionEl,
+        scopeHeaderLabel: scoped.label,
+        scopeMeta: scoped.meta,
+        scopeMetrics,
+        scopeDonut,
+        scopeTools,
         dailyChart,
         dailyMeta: daily.meta,
         refresh,
     }
+}
+
+/** Map the select's value back onto the scope selection state. */
+function applyScopeValue(value: string): void {
+    selectValue = value
+    if (value === "all") {
+        selection = {}
+    } else if (value === "today") {
+        selection = { from: todayKey(), to: todayKey() }
+    } else if (value === "7d") {
+        selection = { from: dayKeyDaysAgo(6), to: todayKey() }
+    } else if (value === "30d") {
+        selection = { from: dayKeyDaysAgo(29), to: todayKey() }
+    } else if (value.startsWith("pid:")) {
+        selection = { pid: value.slice(4) }
+    }
+}
+
+function todayKey(): string {
+    return dayKeyDaysAgo(0)
+}
+
+function dayKeyDaysAgo(days: number): string {
+    const d = new Date()
+    d.setDate(d.getDate() - days)
+    const y = d.getFullYear()
+    const m = String(d.getMonth() + 1).padStart(2, "0")
+    const day = String(d.getDate()).padStart(2, "0")
+    return `${y}-${m}-${day}`
+}
+
+/** Rebuild the scope picker's options from the process list. */
+function rebuildScopeOptions(select: HTMLSelectElement, processes: ProcessSummary[]): void {
+    const current = selectValue
+    select.replaceChildren()
+    const add = (value: string, label: string) => {
+        const opt = document.createElement("option")
+        opt.value = value
+        opt.textContent = label
+        select.appendChild(opt)
+    }
+    add("all", "All time")
+    add("today", "Today")
+    add("7d", "Last 7 days")
+    add("30d", "Last 30 days")
+    if (processes.length > 0) {
+        const group = document.createElement("optgroup")
+        group.label = "Processes"
+        for (const p of processes.slice(0, 40)) {
+            const opt = document.createElement("option")
+            opt.value = `pid:${p.pid}`
+            const when = p.startedAt > 0 ? dayKeyDaysAgo(0) === dayStamp(p.startedAt) ? "today" : dayStamp(p.startedAt) : "?"
+            opt.textContent = `pid ${p.pid} · ${when} · ~${formatTokens(p.tokensSaved)} tok`
+            group.appendChild(opt)
+        }
+        select.appendChild(group)
+    }
+    // restore selection if still valid, else fall back to "all"
+    const stillValid = [...select.options].some((o) => o.value === current)
+    select.value = stillValid ? current : "all"
+    if (!stillValid) applyScopeValue("all")
+}
+
+function dayStamp(timestamp: number): string {
+    const d = new Date(timestamp)
+    const m = String(d.getMonth() + 1).padStart(2, "0")
+    const day = String(d.getDate()).padStart(2, "0")
+    return `${d.getFullYear()}-${m}-${day}`
 }
 
 function mountStatus(): void {
@@ -329,7 +439,13 @@ async function refreshStats(): Promise<void> {
     const seq = ++fetchSeq
     refs?.refresh.update({ loading: true })
     try {
-        const result = await host.serviceRequest({ method: "GET", path: "/stats" })
+        const query: Record<string, string> = {}
+        if (selection.pid) query.pid = selection.pid
+        else {
+            if (selection.from) query.from = selection.from
+            if (selection.to) query.to = selection.to
+        }
+        const result = await host.serviceRequest({ method: "GET", path: "/stats", query })
         if (seq !== fetchSeq) return
         if (result.status !== 200) {
             throw new Error(`stats service responded with HTTP ${result.status}`)
@@ -403,7 +519,8 @@ function render(): void {
     renderNotice()
 
     const live = payload?.live ?? null
-    const allTime = payload?.allTime ?? null
+    const scoped = payload?.scoped ?? null
+    const pricing = payload?.pricing ?? null
     const daily = payload?.daily ?? []
 
     // ---- live
@@ -417,10 +534,20 @@ function render(): void {
     renderToolBars(refs.liveTools, live?.tools ?? [])
     setHint(refs.liveHint, liveHintContent(live))
 
-    // ---- all-time
-    renderMetrics(refs.allTimeMetrics, allTime ? allTimeRows(allTime) : [])
-    renderBytesDonut(refs.allTimeDonut, allTime ? allTimeSegments(allTime) : null)
-    renderToolBars(refs.allTimeTools, allTime?.tools ?? [])
+    // ---- scoped aggregate
+    if (payload) {
+        if (refs.scopeSelect.options.length === 0 || !selectInitialized) {
+            selectInitialized = true
+            rebuildScopeOptions(refs.scopeSelect, payload.processes)
+        } else if (payload.processes.length !== lastProcessCount) {
+            lastProcessCount = payload.processes.length
+            rebuildScopeOptions(refs.scopeSelect, payload.processes)
+        }
+        refs.scopeMeta.textContent = payload.scope.kind === "all" ? "" : payload.scope.label
+    }
+    renderMetrics(refs.scopeMetrics, scoped ? scopeRows(scoped, pricing) : [])
+    renderBytesDonut(refs.scopeDonut, scoped ? scopedSegments(scoped) : null)
+    renderToolBars(refs.scopeTools, scoped?.tools ?? [])
 
     // ---- daily
     refs.dailyMeta.textContent =
@@ -429,6 +556,9 @@ function render(): void {
     if (daily.length > 0) refs.dailyChart.appendChild(columnChart(daily))
     else refs.dailyChart.hidden = true
 }
+
+let selectInitialized = false
+let lastProcessCount = -1
 
 function renderNotice(): void {
     if (!refs) return
@@ -448,7 +578,8 @@ function renderNotice(): void {
 function renderStatus(): void {
     if (!statusRefs) return
     const live = payload?.live ?? null
-    const allTime = payload?.allTime ?? null
+    const scoped = payload?.scoped ?? null
+    const pricing = payload?.pricing ?? null
 
     if (notice) {
         statusRefs.saved.textContent = "Context Mode"
@@ -460,14 +591,15 @@ function renderStatus(): void {
         statusRefs.ratio.hidden = true
         statusRefs.sub.textContent = "stats folder not found"
         statusRefs.sub.classList.add("cm-status-error")
-    } else if (live || allTime) {
+    } else if (live || scoped) {
         const tokens = live?.tokensSaved ?? 0
         statusRefs.saved.textContent = `~${formatTokens(tokens)} tokens saved`
         statusRefs.ratio.hidden = false
         statusRefs.ratio.textContent = `${live?.reductionPct ?? 0}% kept out`
         const bits: string[] = []
         if (live) bits.push(plural(live.totalCalls, "call"))
-        if (allTime) bits.push(`all-time ~${formatTokens(allTime.tokensSaved)}`)
+        if (scoped) bits.push(`all-time ~${formatTokens(scoped.tokensSaved)}`)
+        if (pricing) bits.push(formatDollarRange(pricing))
         statusRefs.sub.textContent = bits.join(" · ")
         statusRefs.sub.classList.remove("cm-status-error")
     } else {
@@ -487,6 +619,7 @@ function renderMetrics(container: HTMLElement, rows: MetricRow[]): void {
             const label = el("span", "cm-metric-label", row.label)
             const value = el("span", "cm-metric-value", row.value)
             if (row.tone) value.dataset.tone = row.tone
+            if (row.title) value.title = row.title
             item.append(label, value)
             return item
         }),
@@ -541,7 +674,7 @@ function liveHintContent(live: LiveProcess | null): (Node | string)[] | null {
     if (payload.reason === "storage-missing") {
         return [
             "context-mode stats folder not found: ",
-            el("code", undefined, payload.storageDir),
+            el("code", undefined, payload.storageDirs.join(" , ")),
             ". If it stores data elsewhere, set CONTEXT_MODE_STATS_DIR for the service.",
         ]
     }
@@ -574,7 +707,6 @@ function syncStatusHeight(): void {
 function liveRows(live: LiveProcess): MetricRow[] {
     return [
         { label: "Tokens saved", value: `~${formatTokens(live.tokensSaved)}`, tone: "success" },
-        { label: "Est. $ saved", value: formatDollars(live.dollarsSaved) },
         { label: "Kept out", value: `${formatBytes(live.keptOut)} (${live.reductionPct}%)` },
         { label: "Processed", value: formatBytes(live.totalProcessed) },
         { label: "Returned to context", value: formatBytes(live.bytesReturned) },
@@ -586,16 +718,40 @@ function liveRows(live: LiveProcess): MetricRow[] {
     ]
 }
 
-function allTimeRows(allTime: AllTime): MetricRow[] {
-    return [
-        { label: "Tokens saved", value: `~${formatTokens(allTime.tokensSaved)}`, tone: "success" },
-        { label: "Est. $ saved", value: formatDollars(allTime.dollarsSaved) },
-        { label: "Kept out", value: formatBytes(allTime.keptOut) },
-        { label: "Processed", value: formatBytes(allTime.totalProcessed) },
-        { label: "Tool calls", value: String(allTime.totalCalls) },
-        { label: "Processes", value: String(allTime.processes) },
-        { label: "Cache", value: `${plural(allTime.cacheHits, "hit")} · ${formatBytes(allTime.cacheBytesSaved)} saved` },
+function scopeRows(scoped: Aggregate, pricing: PricingResult | null): MetricRow[] {
+    const rows: MetricRow[] = [
+        { label: "Tokens saved", value: `~${formatTokens(scoped.tokensSaved)}`, tone: "success" },
     ]
+    if (pricing) {
+        rows.push({
+            label: "Est. value",
+            value: formatDollarRange(pricing),
+            tone: "success",
+            title: pricingTitle(pricing),
+        })
+        const topMix = pricing.mix
+            .filter((m) => m.matched)
+            .slice(0, 3)
+            .map((m) => `${m.model} ${Math.round(m.share * 100)}%`)
+            .join(", ")
+        if (topMix) {
+            rows.push({
+                label: "Model mix",
+                value: topMix,
+                title: pricing.mix
+                    .map((m) => `${m.key}: ${Math.round(m.share * 100)}%${m.matched ? ` → ${m.matched}` : " (no rate match)"}`)
+                    .join("\n"),
+            })
+        }
+    }
+    rows.push(
+        { label: "Kept out", value: formatBytes(scoped.keptOut) },
+        { label: "Processed", value: formatBytes(scoped.totalProcessed) },
+        { label: "Tool calls", value: String(scoped.totalCalls) },
+        { label: "Processes", value: String(scoped.processes) },
+        { label: "Cache", value: `${plural(scoped.cacheHits, "hit")} · ${formatBytes(scoped.cacheBytesSaved)} saved` },
+    )
+    return rows
 }
 
 function liveSegments(live: LiveProcess): BytesSegments {
@@ -605,10 +761,10 @@ function liveSegments(live: LiveProcess): BytesSegments {
     ]
 }
 
-function allTimeSegments(allTime: AllTime): BytesSegments {
+function scopedSegments(scoped: Aggregate): BytesSegments {
     return [
-        { label: "Returned to context", value: allTime.bytesReturned, className: "cm-seg-returned" },
-        { label: "Kept out", value: allTime.keptOut, className: "cm-seg-kept" },
+        { label: "Returned to context", value: scoped.bytesReturned, className: "cm-seg-returned" },
+        { label: "Kept out", value: scoped.keptOut, className: "cm-seg-kept" },
     ]
 }
 
@@ -616,6 +772,7 @@ function allTimeSegments(allTime: AllTime): BytesSegments {
 
 function formatTokens(tokens: number): string {
     const value = Math.max(0, Math.round(tokens))
+    if (value >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(1)}`.replace(/\.0$/, "") + "B"
     if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}`.replace(/\.0$/, "") + "M"
     if (value >= 1000) return `${(value / 1000).toFixed(1)}`.replace(/\.0$/, "") + "K"
     return String(value)
@@ -623,14 +780,32 @@ function formatTokens(tokens: number): string {
 
 function formatBytes(bytes: number): string {
     const value = Math.max(0, bytes)
+    if (value >= 1_073_741_824) return `${(value / 1_073_741_824).toFixed(1)} GB`
     if (value >= 1_048_576) return `${(value / 1_048_576).toFixed(1)} MB`
     if (value >= 1024) return `${(value / 1024).toFixed(1)} KB`
     return `${Math.round(value)} B`
 }
 
+/** "$12.40 – $61.99": cache-read lower bound, full-input upper bound. */
+function formatDollarRange(pricing: PricingResult): string {
+    const min = formatDollars(pricing.dollarsMin)
+    const max = formatDollars(pricing.dollarsMax)
+    return min === max ? min : `${min} – ${max}`
+}
+
+function pricingTitle(pricing: PricingResult): string {
+    const coverage = Math.round(pricing.coverage * 100)
+    return (
+        `Value of saved tokens at your models' real rates (models.dev).\n` +
+        `Lower bound: cache-read rates. Upper bound: full input rates.\n` +
+        `Rate coverage: ${coverage}% of the window's model mix.`
+    )
+}
+
 function formatDollars(dollars: number): string {
     if (!Number.isFinite(dollars) || dollars <= 0) return "$0.00"
     if (dollars < 0.01) return "<$0.01"
+    if (dollars >= 1000) return `$${Math.round(dollars).toLocaleString("en-US")}`
     return `$${dollars.toFixed(2)}`
 }
 
