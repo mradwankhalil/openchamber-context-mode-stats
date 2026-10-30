@@ -1,844 +1,375 @@
 /**
- * Context Mode Stats — OpenChamber extension panel.
+ * Context Mode for OpenChamber — panel controller.
  *
- * One page serves two surfaces:
- *  - `panel`: the rail side panel with the full report.
- *  - `status`: the compact section in the chat's Work Status panel.
+ * <!-- DIRECTION
+ * THESIS: one query, many ledgers. Every number answers to the visible filter
+ *   bar (range, project, search) and every estimate is visibly marked; refuses
+ *   the KPI-card dashboard.
+ * OWN-WORLD: OpenChamber's own theme tokens; sentence-like statement rows of
+ *   tabular figures, hairline-ruled ledgers, one accent for selection and live
+ *   state, hatched amber for anything context-mode estimates.
+ * STORY: see what is in scope, read the statement, sort the ledger, open a
+ *   session to see its context curve and everything context-mode captured.
+ * FIRST VIEWPORT: header with live run chip; view tabs; sticky filter bar;
+ *   the statement and daily activity; the sessions ledger starts below.
+ * FORM: filter-bar explorer (7th of 7 structures), seed c8e73cd2.
+ * FINISH: unreviewed and undocumented is unfinished; this build ends with the
+ *   finish review, the verdict, and DESIGN.md.
+ * -->
  *
- * The page is a thin view. The extension's local service reads the
- * context-mode stats files and returns the numbers; this file only renders
- * them. Charts are hand-rolled SVG/divs — no dependencies.
- *
- * Dollar figures come from the service's pricing engine (models.dev rates
- * weighted by the user's real model mix) and are shown as a range:
- * min = cache-read rates, max = full input rates.
+ * One page serves three host surfaces: the rail panel, the full-screen page
+ * (`surface: "page"`), and the chat's Work Status section (`surface: "status"`).
+ * The page is a view over the extension's local service; it never reads files.
  */
 
-import { connectHost, HostRequestError } from "@openchamber/sdk"
-import type { HostReadyContext } from "@openchamber/sdk"
-import { applyHostReady, mountBanner, mountButton } from "@openchamber/sdk/ui"
-import type { BannerHandle, ButtonHandle } from "@openchamber/sdk/ui"
-import type {
-    Aggregate,
-    DayPoint,
-    LiveProcess,
-    ProcessSummary,
-    StatsPayload,
-    ToolStat,
-} from "../service/stats"
-import type { PricingResult } from "../service/pricing"
+import { connectHost } from "@openchamber/sdk"
+import type { HostReadyContext, JsonValue } from "@openchamber/sdk"
+import { applyHostReady, mountSelect, mountTabs } from "@openchamber/sdk/ui"
+import type { OverviewPayload, StatusPayload } from "../service/types.ts"
+import { createApi, friendly } from "./api.ts"
+import type { App, ViewRenderer } from "./app.ts"
+import { hideTip } from "./charts.ts"
+import { h, icon, iconButton, replace } from "./dom.ts"
+import { bytes, duration, full } from "./format.ts"
+import { DEFAULT_SETTINGS, RANGE_LABELS, initialView, normalize } from "./state.ts"
+import type { RangeKey, UiSettings, View, ViewState } from "./state.ts"
+import { renderDetail } from "./views/detail.ts"
+import { renderInsights } from "./views/insights.ts"
+import { renderKnowledge } from "./views/knowledge.ts"
+import { renderRuns } from "./views/runs.ts"
+import { renderSessions } from "./views/sessions.ts"
+import { renderSettings } from "./views/settings.ts"
+import { renderStatus } from "./views/status.ts"
 
-const POLL_MS = 4000
-const DAILY_WINDOW = 30
-const TOP_TOOLS = 8
-
+const STORAGE_KEY = "settings:v1"
 const host = connectHost()
-const rootElement = document.querySelector<HTMLElement>("#root")
-if (!rootElement) {
-    throw new Error("Missing #root")
-}
-const root = rootElement
+const root = document.querySelector<HTMLElement>("#root")
+if (!root) throw new Error("Missing #root")
 
-type Notice = {
-    tone: "info" | "success" | "warning" | "error"
-    title: string
-    body?: string
-}
-
-type MetricRow = {
-    label: string
-    value: string
-    tone?: "success"
-    title?: string
-}
-
-/** Current scope selection. pid set → single process; else optional range. */
-type ScopeSelection = {
-    pid?: string
-    from?: string
-    to?: string
-}
-
+let settings: UiSettings = structuredClone(DEFAULT_SETTINGS)
+let view: ViewState = initialView(settings)
+let status: StatusPayload | null = null
 let mounted = false
-let surface: "panel" | "status" = "panel"
-let payload: StatsPayload | null = null
-let notice: Notice | null = null
+let surface: HostReadyContext["surface"] = "panel"
+let renderSeq = 0
+let rendering = false
 let pollTimer: number | null = null
-let fetchSeq = 0
-let lastStatusHeight = -1
-let selection: ScopeSelection = {}
-let selectValue = "all"
+let lastRenderAt = 0
+const current = { sessionId: null as string | null, directory: null as string | null }
+
+const api = createApi(host, () => settings.service)
+
+const app: App = {
+    host,
+    api,
+    get settings() { return settings },
+    get view() { return view },
+    get status() { return status },
+    current,
+    go(patch, opts) {
+        const viewChanged = patch.view !== undefined && patch.view !== view.view
+        view = { ...view, ...patch }
+        if (viewChanged && patch.sessionId === undefined) view.sessionId = null
+        if (patch.range !== undefined || patch.project !== undefined || patch.q !== undefined) {
+            view.offset = 0
+            view.runsOffset = 0
+            view.kbOffset = 0
+        }
+        syncChrome()
+        void render({ keepScroll: opts?.keepScroll ?? false })
+    },
+    async saveSettings(next) {
+        settings = normalize(next)
+        applyScale()
+        try {
+            await host.storage.set(STORAGE_KEY, settings as unknown as JsonValue)
+        } catch (error) {
+            app.toast(`Could not save settings: ${friendly(error).message}`, "error")
+        }
+        schedulePoll()
+        syncChrome()
+    },
+    refresh() {
+        void render({ keepScroll: true })
+    },
+    copy(text, what) {
+        host.writeClipboard(text).then(() => app.toast(`${what} copied`, "success"), (e) => app.toast(friendly(e).message, "error"))
+    },
+    toast(message, kind = "info") {
+        void host.toast({ kind, message }).catch(() => undefined)
+    },
+}
+
+// ------------------------------------------------------------------ chrome
 
 let refs: {
-    subtitle: HTMLElement
+    liveChip: HTMLElement
+    privacyBtn: HTMLButtonElement
+    refreshBtn: HTMLButtonElement
+    settingsBtn: HTMLButtonElement
+    tabs: ReturnType<typeof mountTabs>
+    filterbar: HTMLElement
+    rangeSeg: HTMLElement
+    dateRange: HTMLElement
+    fromInput: HTMLInputElement
+    toInput: HTMLInputElement
+    project: ReturnType<typeof mountSelect>
+    search: HTMLInputElement
     notice: HTMLElement
-    liveMeta: HTMLElement
-    liveMetrics: HTMLElement
-    liveDonut: HTMLElement
-    liveTools: HTMLElement
-    liveHint: HTMLElement
-    scopeSelect: HTMLSelectElement
-    scopeSection: HTMLElement
-    scopeHeaderLabel: HTMLElement
-    scopeMeta: HTMLElement
-    scopeMetrics: HTMLElement
-    scopeDonut: HTMLElement
-    scopeTools: HTMLElement
-    dailyChart: HTMLElement
-    dailyMeta: HTMLElement
-    refresh: ButtonHandle
+    progress: HTMLElement
+    main: HTMLElement
 } | null = null
 
-let statusRefs: {
-    saved: HTMLElement
-    ratio: HTMLElement
-    sub: HTMLElement
-} | null = null
+let projectOptions: { id: string; label: string; hint?: string }[] = [{ id: "", label: "All projects" }]
 
-let noticeHandle: BannerHandle | null = null
-
-// ---------------------------------------------------------------- dom helpers
-
-function el<K extends keyof HTMLElementTagNameMap>(
-    tag: K,
-    className?: string,
-    text?: string,
-): HTMLElementTagNameMap[K] {
-    const node = document.createElement(tag)
-    if (className) node.className = className
-    if (text !== undefined) node.textContent = text
-    return node
-}
-
-// -------------------------------------------------------------------- charts
-
-/** Donut chart. Segments share 100% of the ring; center shows `centerLabel`. */
-function donut(
-    segments: { label: string; value: number; className: string }[],
-    centerValue: string,
-    centerLabel: string,
-): SVGSVGElement {
-    const total = segments.reduce((sum, s) => sum + Math.max(0, s.value), 0)
-    const size = 120
-    const stroke = 18
-    const radius = (size - stroke) / 2
-    const circumference = 2 * Math.PI * radius
-    const svgNS = "http://www.w3.org/2000/svg"
-    const svg = document.createElementNS(svgNS, "svg")
-    svg.setAttribute("viewBox", `0 0 ${size} ${size}`)
-    svg.setAttribute("class", "cm-donut")
-
-    const track = document.createElementNS(svgNS, "circle")
-    track.setAttribute("cx", String(size / 2))
-    track.setAttribute("cy", String(size / 2))
-    track.setAttribute("r", String(radius))
-    track.setAttribute("class", "cm-donut-track")
-    track.setAttribute("stroke-width", String(stroke))
-    track.setAttribute("fill", "none")
-    svg.appendChild(track)
-
-    if (total > 0) {
-        let offset = 0
-        for (const seg of segments) {
-            const frac = Math.max(0, seg.value) / total
-            if (frac <= 0) continue
-            const arc = document.createElementNS(svgNS, "circle")
-            arc.setAttribute("cx", String(size / 2))
-            arc.setAttribute("cy", String(size / 2))
-            arc.setAttribute("r", String(radius))
-            arc.setAttribute("class", `cm-donut-seg ${seg.className}`)
-            arc.setAttribute("stroke-width", String(stroke))
-            arc.setAttribute("fill", "none")
-            arc.setAttribute("stroke-dasharray", `${frac * circumference} ${circumference}`)
-            arc.setAttribute("stroke-dashoffset", String(-offset * circumference))
-            arc.setAttribute("transform", `rotate(-90 ${size / 2} ${size / 2})`)
-            arc.appendChild(svgTitle(arc, `${seg.label}: ${(frac * 100).toFixed(1)}%`))
-            svg.appendChild(arc)
-            offset += frac
-        }
-    }
-
-    const valueText = document.createElementNS(svgNS, "text")
-    valueText.setAttribute("x", String(size / 2))
-    valueText.setAttribute("y", String(size / 2 - 2))
-    valueText.setAttribute("class", "cm-donut-value")
-    valueText.setAttribute("text-anchor", "middle")
-    valueText.textContent = centerValue
-    const labelText = document.createElementNS(svgNS, "text")
-    labelText.setAttribute("x", String(size / 2))
-    labelText.setAttribute("y", String(size / 2 + 14))
-    labelText.setAttribute("class", "cm-donut-label")
-    labelText.setAttribute("text-anchor", "middle")
-    labelText.textContent = centerLabel
-    svg.appendChild(valueText)
-    svg.appendChild(labelText)
-    return svg
-}
-
-function svgTitle(parent: SVGElement, text: string): SVGElement {
-    const title = document.createElementNS("http://www.w3.org/2000/svg", "title")
-    title.textContent = text
-    parent.appendChild(title)
-    return parent
-}
-
-function donutLegend(
-    segments: { label: string; value: number; className: string }[],
-    format: (value: number) => string,
-): HTMLElement {
-    const legend = el("div", "cm-legend")
-    for (const seg of segments) {
-        const row = el("div", "cm-legend-row")
-        row.append(
-            el("span", `cm-legend-dot ${seg.className}`),
-            el("span", "cm-legend-label", seg.label),
-            el("span", "cm-legend-value", format(seg.value)),
-        )
-        legend.appendChild(row)
-    }
-    return legend
-}
-
-/** Horizontal bar list for ranked data (per-tool). */
-function hbarChart(
-    rows: { label: string; value: number; display: string }[],
-): HTMLElement {
-    const wrap = el("div", "cm-hbars")
-    const max = rows.reduce((m, r) => Math.max(m, r.value), 0)
-    for (const row of rows) {
-        const item = el("div", "cm-hbar")
-        const head = el("div", "cm-hbar-head")
-        head.append(
-            el("span", "cm-hbar-label", row.label),
-            el("span", "cm-hbar-value", row.display),
-        )
-        const track = el("div", "cm-hbar-track")
-        const fill = el("div", "cm-hbar-fill")
-        fill.style.width = max > 0 ? `${Math.max(2, (row.value / max) * 100)}%` : "0%"
-        track.appendChild(fill)
-        item.append(head, track)
-        wrap.appendChild(item)
-    }
-    return wrap
-}
-
-/** Column chart for the daily savings series. */
-function columnChart(points: DayPoint[]): HTMLElement {
-    const wrap = el("div", "cm-cols")
-    const shown = points.slice(-DAILY_WINDOW)
-    const max = shown.reduce((m, p) => Math.max(m, p.tokensSaved), 0)
-    const svgNS = "http://www.w3.org/2000/svg"
-    const svg = document.createElementNS(svgNS, "svg")
-    svg.setAttribute("class", "cm-cols-svg")
-    const width = Math.max(120, shown.length * 14)
-    const height = 72
-    const barWidth = 10
-    svg.setAttribute("viewBox", `0 0 ${width} ${height + 16}`)
-    svg.setAttribute("preserveAspectRatio", "none")
-
-    shown.forEach((point, i) => {
-        const frac = max > 0 ? point.tokensSaved / max : 0
-        const barHeight = Math.max(point.tokensSaved > 0 ? 2 : 0, frac * (height - 6))
-        const rect = document.createElementNS(svgNS, "rect")
-        rect.setAttribute("x", String(i * 14 + 2))
-        rect.setAttribute("y", String(height - barHeight))
-        rect.setAttribute("width", String(barWidth))
-        rect.setAttribute("height", String(barHeight))
-        rect.setAttribute("rx", "2")
-        rect.setAttribute("class", "cm-col")
-        const title = document.createElementNS(svgNS, "title")
-        title.textContent = `${point.day}: ~${formatTokens(point.tokensSaved)} tokens saved · ${plural(point.calls, "call")}`
-        rect.appendChild(title)
-        svg.appendChild(rect)
-    })
-
-    const labelIndices = [...new Set([0, Math.floor((shown.length - 1) / 2), shown.length - 1])]
-    for (const i of labelIndices) {
-        const point = shown[i]
-        if (!point) continue
-        const text = document.createElementNS(svgNS, "text")
-        text.setAttribute("x", String(i * 14 + 2))
-        text.setAttribute("y", String(height + 12))
-        text.setAttribute("class", "cm-col-label")
-        text.textContent = point.day.slice(5)
-        svg.appendChild(text)
-    }
-
-    wrap.appendChild(svg)
-    return wrap
-}
-
-// -------------------------------------------------------------------- mounting
-
-function section(title: string): { sectionEl: HTMLElement; meta: HTMLElement; label: HTMLElement } {
-    const sectionEl = el("section", "cm-section")
-    const header = el("div", "cm-section-header")
-    const label = el("span", undefined, title)
-    const meta = el("span", "cm-section-meta", "")
-    header.append(label, meta)
-    sectionEl.appendChild(header)
-    return { sectionEl, meta, label }
+function applyScale(): void {
+    document.documentElement.style.fontSize = `${settings.display.scale}px`
 }
 
 function mountPanel(): void {
-    const panel = el("div", "cm cm-panel")
-
-    const header = el("div", "cm-header")
-    const heading = el("div", "cm-heading")
-    const title = el("div", "cm-title", "Context Mode")
-    const subtitle = el("div", "cm-subtitle", "")
-    heading.append(title, subtitle)
-    const actions = el("div", "cm-actions")
-    const refresh = mountButton(actions, {
-        label: "Refresh",
-        variant: "ghost",
-        size: "xs",
-        onClick: () => void refreshStats(),
+    const brand = h("div.brand", null, h("img", { src: "../icon.svg", alt: "" }), h("h1", null, "Context Mode"))
+    const liveChip = h("span.live-chip", { title: "context-mode MCP server" }, h("span.dot"), "Connecting…")
+    const privacyBtn = iconButton("eye", "Hide event text", () => {
+        const next = structuredClone(settings)
+        next.service.privacy.showContent = !settings.service.privacy.showContent
+        void app.saveSettings(next).then(() => app.refresh())
     })
-    header.append(heading, actions)
+    const refreshBtn = iconButton("refresh", "Refresh now", () => app.refresh())
+    const settingsBtn = iconButton("settings", "Settings", () => app.go({ view: view.view === "settings" ? settings.display.defaultView : "settings" }))
+    const topbar = h("header.topbar", null, brand, liveChip, h("div.actions", null, privacyBtn, refreshBtn, settingsBtn))
 
-    const noticeEl = el("div", "cm-notice")
-    const body = el("div", "cm-body")
-
-    // Live process
-    const live = section("Live process")
-    const liveMetrics = el("div", "cm-metrics")
-    const liveDonut = el("div", "cm-chart")
-    const liveTools = el("div", "cm-subsection")
-    const liveHint = el("div", "cm-hint")
-    live.sectionEl.append(liveMetrics, liveDonut, liveTools, liveHint)
-
-    // Scoped aggregate
-    const scoped = section("All time")
-    const scopeSelect = document.createElement("select")
-    scopeSelect.className = "cm-scope-select"
-    scopeSelect.addEventListener("change", () => {
-        applyScopeValue(scopeSelect.value)
-        void refreshStats()
+    const navEl = h("nav.nav", { "aria-label": "Views" })
+    const tabs = mountTabs(navEl, {
+        items: [
+            { id: "sessions", label: "Sessions" },
+            { id: "insights", label: "Insights" },
+            { id: "runs", label: "Runs" },
+            { id: "knowledge", label: "Knowledge" },
+        ],
+        activeId: view.view === "settings" ? "" : view.view,
+        onChange: (id) => app.go({ view: id as View, sessionId: null }),
     })
-    scoped.label.replaceChildren(scopeSelect)
-    const scopeMetrics = el("div", "cm-metrics")
-    const scopeDonut = el("div", "cm-chart")
-    const scopeTools = el("div", "cm-subsection")
-    scoped.sectionEl.append(scopeMetrics, scopeDonut, scopeTools)
 
-    // Daily series
-    const daily = section("Tokens saved per day")
-    const dailyChart = el("div", "cm-chart")
-    daily.sectionEl.appendChild(dailyChart)
-
-    body.append(live.sectionEl, scoped.sectionEl, daily.sectionEl)
-    panel.append(header, noticeEl, body)
-    root.replaceChildren(panel)
-
-    refs = {
-        subtitle,
-        notice: noticeEl,
-        liveMeta: live.meta,
-        liveMetrics,
-        liveDonut,
-        liveTools,
-        liveHint,
-        scopeSelect,
-        scopeSection: scoped.sectionEl,
-        scopeHeaderLabel: scoped.label,
-        scopeMeta: scoped.meta,
-        scopeMetrics,
-        scopeDonut,
-        scopeTools,
-        dailyChart,
-        dailyMeta: daily.meta,
-        refresh,
+    const rangeSeg = h("div.seg", { role: "group", "aria-label": "Date range" })
+    for (const key of ["today", "7d", "30d", "90d", "all", "custom"] as RangeKey[]) {
+        const b = h("button", { type: "button", "data-range": key }, RANGE_LABELS[key])
+        b.addEventListener("click", () => app.go({ range: key }))
+        rangeSeg.appendChild(b)
     }
-}
-
-/** Map the select's value back onto the scope selection state. */
-function applyScopeValue(value: string): void {
-    selectValue = value
-    if (value === "all") {
-        selection = {}
-    } else if (value === "today") {
-        selection = { from: todayKey(), to: todayKey() }
-    } else if (value === "7d") {
-        selection = { from: dayKeyDaysAgo(6), to: todayKey() }
-    } else if (value === "30d") {
-        selection = { from: dayKeyDaysAgo(29), to: todayKey() }
-    } else if (value.startsWith("pid:")) {
-        selection = { pid: value.slice(4) }
-    }
-}
-
-function todayKey(): string {
-    return dayKeyDaysAgo(0)
-}
-
-function dayKeyDaysAgo(days: number): string {
-    const d = new Date()
-    d.setDate(d.getDate() - days)
-    const y = d.getFullYear()
-    const m = String(d.getMonth() + 1).padStart(2, "0")
-    const day = String(d.getDate()).padStart(2, "0")
-    return `${y}-${m}-${day}`
-}
-
-/** Rebuild the scope picker's options from the process list. */
-function rebuildScopeOptions(select: HTMLSelectElement, processes: ProcessSummary[]): void {
-    const current = selectValue
-    select.replaceChildren()
-    const add = (value: string, label: string) => {
-        const opt = document.createElement("option")
-        opt.value = value
-        opt.textContent = label
-        select.appendChild(opt)
-    }
-    add("all", "All time")
-    add("today", "Today")
-    add("7d", "Last 7 days")
-    add("30d", "Last 30 days")
-    if (processes.length > 0) {
-        const group = document.createElement("optgroup")
-        group.label = "Processes"
-        for (const p of processes.slice(0, 40)) {
-            const opt = document.createElement("option")
-            opt.value = `pid:${p.pid}`
-            const when = p.startedAt > 0 ? dayKeyDaysAgo(0) === dayStamp(p.startedAt) ? "today" : dayStamp(p.startedAt) : "?"
-            opt.textContent = `pid ${p.pid} · ${when} · ~${formatTokens(p.tokensSaved)} tok`
-            group.appendChild(opt)
-        }
-        select.appendChild(group)
-    }
-    // restore selection if still valid, else fall back to "all"
-    const stillValid = [...select.options].some((o) => o.value === current)
-    select.value = stillValid ? current : "all"
-    if (!stillValid) applyScopeValue("all")
-}
-
-function dayStamp(timestamp: number): string {
-    const d = new Date(timestamp)
-    const m = String(d.getMonth() + 1).padStart(2, "0")
-    const day = String(d.getDate()).padStart(2, "0")
-    return `${d.getFullYear()}-${m}-${day}`
-}
-
-function mountStatus(): void {
-    const status = el("div", "cm cm-status")
-    const main = el("div", "cm-status-main")
-    const saved = el("span", "cm-status-saved", "Context Mode")
-    const ratio = el("span", "cm-status-ratio")
-    ratio.hidden = true
-    main.append(saved, ratio)
-    const sub = el("div", "cm-status-sub", "")
-    status.append(main, sub)
-    root.replaceChildren(status)
-    statusRefs = { saved, ratio, sub }
-}
-
-// -------------------------------------------------------------------- fetching
-
-async function refreshStats(): Promise<void> {
-    const seq = ++fetchSeq
-    refs?.refresh.update({ loading: true })
-    try {
-        const query: Record<string, string> = {}
-        if (selection.pid) query.pid = selection.pid
-        else {
-            if (selection.from) query.from = selection.from
-            if (selection.to) query.to = selection.to
-        }
-        const result = await host.serviceRequest({ method: "GET", path: "/stats", query })
-        if (seq !== fetchSeq) return
-        if (result.status !== 200) {
-            throw new Error(`stats service responded with HTTP ${result.status}`)
-        }
-        payload = JSON.parse(result.body) as StatsPayload
-        notice = null
-    } catch (error) {
-        if (seq !== fetchSeq) return
-        notice = describeError(error)
-    } finally {
-        if (seq === fetchSeq) {
-            refs?.refresh.update({ loading: false })
-            render()
-        }
-    }
-}
-
-function describeError(error: unknown): Notice {
-    if (error instanceof HostRequestError) {
-        switch (error.code) {
-            case "NO_SERVICE":
-                return {
-                    tone: "warning",
-                    title: "Local service not approved",
-                    body: "Open Settings → Extensions, select Context Mode Stats, and allow its local service. Then retry.",
-                }
-            case "DISABLED":
-                return {
-                    tone: "info",
-                    title: "Context Mode Stats is paused",
-                    body: "Enable the extension in Settings → Extensions.",
-                }
-            case "SERVICE_FAILED":
-            case "HOST_TIMEOUT":
-                return {
-                    tone: "error",
-                    title: "Stats service is not responding",
-                    body: "Retry, or restart OpenChamber if it keeps failing.",
-                }
-            default:
-                return { tone: "error", title: "Could not load stats", body: error.message }
-        }
-    }
-    return {
-        tone: "error",
-        title: "Could not load stats",
-        body: error instanceof Error ? error.message : String(error),
-    }
-}
-
-function startPolling(): void {
-    if (pollTimer !== null) return
-    pollTimer = window.setInterval(() => {
-        if (document.visibilityState === "visible") void refreshStats()
-    }, POLL_MS)
-    document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState === "visible") void refreshStats()
+    const fromInput = h("input.date-input", { type: "date", "aria-label": "From" }) as HTMLInputElement
+    const toInput = h("input.date-input", { type: "date", "aria-label": "To" }) as HTMLInputElement
+    fromInput.addEventListener("change", () => fromInput.value && app.go({ customFrom: fromInput.value }))
+    toInput.addEventListener("change", () => toInput.value && app.go({ customTo: toInput.value }))
+    const dateRange = h("span.daterange", null, fromInput, "to", toInput)
+    const projectHost = h("div.filter-project")
+    const project = mountSelect(projectHost, {
+        value: view.project,
+        options: projectOptions,
+        searchable: true,
+        searchPlaceholder: "Find a project",
+        placeholder: "All projects",
+        onChange: (id) => {
+            project.update({ value: id })
+            app.go({ project: id })
+        },
     })
+    const search = h("input.text-input", { type: "search", placeholder: "Search sessions, ids, models", "aria-label": "Search" }) as HTMLInputElement
+    let searchTimer: number | undefined
+    search.addEventListener("input", () => {
+        window.clearTimeout(searchTimer)
+        searchTimer = window.setTimeout(() => app.go({ q: search.value }, { keepScroll: true }), 260)
+    })
+    const filterbar = h("div.filterbar", null, rangeSeg, dateRange, projectHost, h("div.search", null, icon("search", 16), search))
+    const notice = h("div.notice")
+    const progress = h("div")
+    const main = h("main.view", { "aria-live": "polite" })
+    replace(root!, h("div.app", null, topbar, navEl, filterbar, notice, progress, main))
+    refs = { liveChip, privacyBtn, refreshBtn, settingsBtn, tabs, filterbar, rangeSeg, dateRange, fromInput, toInput, project, search, notice, progress, main }
+    syncChrome()
 }
 
-// -------------------------------------------------------------------- render
-
-function render(): void {
-    if (surface === "status") {
-        renderStatus()
-        return
-    }
+function syncChrome(): void {
     if (!refs) return
-
-    refs.subtitle.textContent = "context-mode savings"
-    renderNotice()
-
-    const live = payload?.live ?? null
-    const scoped = payload?.scoped ?? null
-    const pricing = payload?.pricing ?? null
-    const daily = payload?.daily ?? []
-
-    // ---- live
-    refs.liveMeta.textContent = live
-        ? payload?.liveStale
-            ? `pid ${live.pid} · idle`
-            : `pid ${live.pid} · active`
-        : ""
-    renderMetrics(refs.liveMetrics, live ? liveRows(live) : [])
-    renderBytesDonut(refs.liveDonut, live ? liveSegments(live) : null)
-    renderToolBars(refs.liveTools, live?.tools ?? [])
-    setHint(refs.liveHint, liveHintContent(live))
-
-    // ---- scoped aggregate
-    if (payload) {
-        if (refs.scopeSelect.options.length === 0 || !selectInitialized) {
-            selectInitialized = true
-            rebuildScopeOptions(refs.scopeSelect, payload.processes)
-        } else if (payload.processes.length !== lastProcessCount) {
-            lastProcessCount = payload.processes.length
-            rebuildScopeOptions(refs.scopeSelect, payload.processes)
-        }
-        refs.scopeMeta.textContent = payload.scope.kind === "all" ? "" : payload.scope.label
-    }
-    renderMetrics(refs.scopeMetrics, scoped ? scopeRows(scoped, pricing) : [])
-    renderBytesDonut(refs.scopeDonut, scoped ? scopedSegments(scoped) : null)
-    renderToolBars(refs.scopeTools, scoped?.tools ?? [])
-
-    // ---- daily
-    refs.dailyMeta.textContent =
-        daily.length > 0 ? `last ${Math.min(daily.length, DAILY_WINDOW)} of ${plural(daily.length, "day")}` : ""
-    refs.dailyChart.replaceChildren()
-    if (daily.length > 0) refs.dailyChart.appendChild(columnChart(daily))
-    else refs.dailyChart.hidden = true
+    refs.tabs.update({ activeId: view.view === "settings" ? "" : view.view })
+    refs.filterbar.hidden = view.view === "settings"
+    refs.settingsBtn.setAttribute("aria-pressed", String(view.view === "settings"))
+    refs.rangeSeg.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.range === view.range)))
+    refs.dateRange.hidden = view.range !== "custom"
+    refs.fromInput.value = view.customFrom
+    refs.toInput.value = view.customTo
+    refs.project.update({ value: view.project, options: projectOptions })
+    if (refs.search.value !== view.q && document.activeElement !== refs.search) refs.search.value = view.q
+    const shown = settings.service.privacy.showContent
+    replace(refs.privacyBtn, icon(shown ? "eye" : "eyeOff"))
+    refs.privacyBtn.setAttribute("aria-label", shown ? "Hide event text" : "Show event text")
+    refs.privacyBtn.title = shown ? "Event text is shown — click to hide it" : "Event text is hidden — click to show it"
+    refs.privacyBtn.setAttribute("aria-pressed", String(!shown))
+    // The ledger header sticks below the filter bar.
+    root!.style.setProperty("--sticky-top", view.view === "settings" ? "0px" : `${refs.filterbar.offsetHeight}px`)
 }
 
-let selectInitialized = false
-let lastProcessCount = -1
-
-function renderNotice(): void {
+function paintStatus(): void {
     if (!refs) return
-    noticeHandle?.dispose()
-    noticeHandle = null
-    refs.notice.replaceChildren()
-    if (!notice) return
-    const showRetry = notice.tone === "error" || notice.tone === "warning"
-    noticeHandle = mountBanner(refs.notice, {
-        tone: notice.tone,
-        title: notice.title,
-        ...(notice.body ? { body: notice.body } : {}),
-        ...(showRetry ? { action: { label: "Retry", onClick: () => void refreshStats() } } : {}),
-    })
-}
-
-function renderStatus(): void {
-    if (!statusRefs) return
-    const live = payload?.live ?? null
-    const scoped = payload?.scoped ?? null
-    const pricing = payload?.pricing ?? null
-
-    if (notice) {
-        statusRefs.saved.textContent = "Context Mode"
-        statusRefs.ratio.hidden = true
-        statusRefs.sub.textContent = notice.title
-        statusRefs.sub.classList.add("cm-status-error")
-    } else if (payload?.reason === "storage-missing") {
-        statusRefs.saved.textContent = "Context Mode"
-        statusRefs.ratio.hidden = true
-        statusRefs.sub.textContent = "stats folder not found"
-        statusRefs.sub.classList.add("cm-status-error")
-    } else if (live || scoped) {
-        const tokens = live?.tokensSaved ?? 0
-        statusRefs.saved.textContent = `~${formatTokens(tokens)} tokens saved`
-        statusRefs.ratio.hidden = false
-        statusRefs.ratio.textContent = `${live?.reductionPct ?? 0}% kept out`
-        const bits: string[] = []
-        if (live) bits.push(plural(live.totalCalls, "call"))
-        if (scoped) bits.push(`all-time ~${formatTokens(scoped.tokensSaved)}`)
-        if (pricing) bits.push(formatDollarRange(pricing))
-        statusRefs.sub.textContent = bits.join(" · ")
-        statusRefs.sub.classList.remove("cm-status-error")
+    const s = status
+    const lives = s?.liveRuns ?? []
+    if (lives.length) {
+        const calls = lives.reduce((a, r) => a + r.calls, 0)
+        const returned = lives.reduce((a, r) => a + r.bytesReturned, 0)
+        const up = Math.max(...lives.map((r) => r.uptimeMs))
+        replace(refs.liveChip, h("span.dot.on"), h("b", null, lives.length > 1 ? `${lives.length} servers live` : "Live"), ` · ${full(calls)} calls · ${bytes(returned)} returned · up ${duration(up)}`)
+        refs.liveChip.title = lives.map((r) => `context-mode server started ${new Date(r.startedAt).toLocaleTimeString()} (parent pid ${r.pid}): ${r.calls} calls`).join("\n") + "\nCounters reset when OpenCode restarts."
     } else {
-        statusRefs.saved.textContent = "Context Mode"
-        statusRefs.ratio.hidden = true
-        statusRefs.sub.textContent = "No stats recorded yet"
-        statusRefs.sub.classList.remove("cm-status-error")
+        replace(refs.liveChip, h("span.dot"), s ? "No live context-mode server" : "Connecting…")
     }
-
-    syncStatusHeight()
+    const p = s?.progress
+    if (p && p.phase === "scanning") {
+        const pctDone = p.total ? Math.round((p.done / p.total) * 100) : 0
+        replace(refs.progress, h("div.progress", null,
+            h("span", null, `Indexing context-mode history: ${full(p.done)} of ${full(p.total)} session databases. Numbers fill in as it goes.`),
+            h("div.progress-track", null, h("div.progress-fill", { style: `--p:${(pctDone / 100).toFixed(3)}` }))))
+    } else replace(refs.progress)
 }
 
-function renderMetrics(container: HTMLElement, rows: MetricRow[]): void {
-    container.replaceChildren(
-        ...rows.map((row) => {
-            const item = el("div", "cm-metric")
-            const label = el("span", "cm-metric-label", row.label)
-            const value = el("span", "cm-metric-value", row.value)
-            if (row.tone) value.dataset.tone = row.tone
-            if (row.title) value.title = row.title
-            item.append(label, value)
-            return item
-        }),
-    )
-    container.hidden = rows.length === 0
+// ----------------------------------------------------------------- render
+
+const VIEWS: Record<Exclude<View, "sessions">, ViewRenderer> = {
+    insights: renderInsights,
+    runs: renderRuns,
+    knowledge: renderKnowledge,
+    settings: renderSettings,
 }
 
-type BytesSegments = { label: string; value: number; className: string }[]
-
-function renderBytesDonut(container: HTMLElement, segments: BytesSegments | null): void {
-    container.replaceChildren()
-    if (!segments) {
-        container.hidden = true
-        return
-    }
-    const total = segments.reduce((sum, s) => sum + s.value, 0)
-    if (total <= 0) {
-        container.hidden = true
-        return
-    }
-    container.hidden = false
-    const kept = segments.find((s) => s.className === "cm-seg-kept")?.value ?? 0
-    const pct = Math.round((kept / total) * 100)
-    const chart = el("div", "cm-donut-wrap")
-    chart.appendChild(donut(segments, `${pct}%`, "kept out"))
-    chart.appendChild(donutLegend(segments, formatBytes))
-    container.appendChild(chart)
-}
-
-function renderToolBars(container: HTMLElement, tools: ToolStat[]): void {
-    container.replaceChildren()
-    if (tools.length === 0) {
-        container.hidden = true
-        return
-    }
-    container.hidden = false
-    const top = tools.slice(0, TOP_TOOLS)
-    container.appendChild(el("div", "cm-subsection-title", "Top tools by bytes"))
-    container.appendChild(
-        hbarChart(
-            top.map((t) => ({
-                label: t.name,
-                value: t.bytes,
-                display: `${formatBytes(t.bytes)} · ${plural(t.calls, "call")}`,
-            })),
-        ),
-    )
-}
-
-function liveHintContent(live: LiveProcess | null): (Node | string)[] | null {
-    if (payload === null) return ["Loading stats…"]
-    if (payload.reason === "storage-missing") {
-        return [
-            "context-mode stats folder not found: ",
-            el("code", undefined, payload.storageDirs.join(" , ")),
-            ". If it stores data elsewhere, set CONTEXT_MODE_STATS_DIR for the service.",
-        ]
-    }
-    if (!live) return ["No context-mode stats recorded yet."]
-    return null
-}
-
-function setHint(node: HTMLElement, content: (Node | string)[] | null): void {
-    if (!content || content.length === 0) {
-        node.hidden = true
-        node.replaceChildren()
-        return
-    }
-    node.hidden = false
-    node.replaceChildren(...content)
-}
-
-function syncStatusHeight(): void {
-    if (surface !== "status") return
-    const node = root.firstElementChild
-    if (!(node instanceof HTMLElement)) return
-    const height = Math.ceil(node.scrollHeight)
-    if (height <= 0 || height === lastStatusHeight) return
-    lastStatusHeight = height
-    void host.setHeight(height).catch(() => {})
-}
-
-// -------------------------------------------------------------------- rows
-
-function liveRows(live: LiveProcess): MetricRow[] {
-    return [
-        { label: "Tokens saved", value: `~${formatTokens(live.tokensSaved)}`, tone: "success" },
-        { label: "Kept out", value: `${formatBytes(live.keptOut)} (${live.reductionPct}%)` },
-        { label: "Processed", value: formatBytes(live.totalProcessed) },
-        { label: "Returned to context", value: formatBytes(live.bytesReturned) },
-        { label: "Indexed", value: formatBytes(live.bytesIndexed) },
-        { label: "Sandboxed", value: formatBytes(live.bytesSandboxed) },
-        { label: "Tool calls", value: String(live.totalCalls) },
-        { label: "Cache", value: `${plural(live.cacheHits, "hit")} · ${formatBytes(live.cacheBytesSaved)} saved` },
-        { label: "Uptime", value: formatDuration(live.uptimeMs) },
-    ]
-}
-
-function scopeRows(scoped: Aggregate, pricing: PricingResult | null): MetricRow[] {
-    const rows: MetricRow[] = [
-        { label: "Tokens saved", value: `~${formatTokens(scoped.tokensSaved)}`, tone: "success" },
-    ]
-    if (pricing) {
-        rows.push({
-            label: "Est. value",
-            value: formatDollarRange(pricing),
-            tone: "success",
-            title: pricingTitle(pricing),
-        })
-        const topMix = pricing.mix
-            .filter((m) => m.matched)
-            .slice(0, 3)
-            .map((m) => `${m.model} ${Math.round(m.share * 100)}%`)
-            .join(", ")
-        if (topMix) {
-            rows.push({
-                label: "Model mix",
-                value: topMix,
-                title: pricing.mix
-                    .map((m) => `${m.key}: ${Math.round(m.share * 100)}%${m.matched ? ` → ${m.matched}` : " (no rate match)"}`)
-                    .join("\n"),
-            })
+async function render(opts: { keepScroll: boolean } = { keepScroll: true }): Promise<void> {
+    const seq = ++renderSeq
+    const isStale = () => seq !== renderSeq
+    rendering = true
+    hideTip()
+    if (refs) refs.refreshBtn.classList.add("spin")
+    try {
+        if (surface === "status") {
+            await renderStatus(app, root!, isStale)
+            if (!isStale()) void host.setHeight(Math.ceil(root!.scrollHeight)).catch(() => undefined)
+            return
+        }
+        const main = refs!.main
+        const scroll = document.scrollingElement?.scrollTop ?? 0
+        status = await api<StatusPayload>("/v1/status")
+        if (isStale()) return
+        paintStatus()
+        const renderer: ViewRenderer = view.view === "sessions" ? (view.sessionId ? renderDetail : renderSessions) : VIEWS[view.view]
+        await renderer(app, main, isStale)
+        if (isStale()) return
+        replace(refs!.notice)
+        if (opts.keepScroll && document.scrollingElement) document.scrollingElement.scrollTop = scroll
+        else if (!opts.keepScroll) window.scrollTo({ top: 0 })
+        syncChrome()
+        lastRenderAt = Date.now()
+    } catch (error) {
+        if (isStale()) return
+        const f = friendly(error)
+        const target = surface === "status" ? root! : refs!.notice
+        replace(target, h("div.explain", null,
+            h("h3", null, f.code === "NOT_FOUND" ? "Session not found" : "Could not load context-mode data"),
+            h("p", null, f.message),
+            f.code === "NOT_FOUND" ? null : h("p.muted", null, `Code: ${f.code}`)))
+        if (f.code === "NOT_FOUND" && view.sessionId) {
+            view.sessionId = null
+        }
+        if (surface === "status") void host.setHeight(Math.ceil(root!.scrollHeight)).catch(() => undefined)
+    } finally {
+        if (!isStale()) {
+            rendering = false
+            refs?.refreshBtn.classList.remove("spin")
         }
     }
-    rows.push(
-        { label: "Kept out", value: formatBytes(scoped.keptOut) },
-        { label: "Processed", value: formatBytes(scoped.totalProcessed) },
-        { label: "Tool calls", value: String(scoped.totalCalls) },
-        { label: "Processes", value: String(scoped.processes) },
-        { label: "Cache", value: `${plural(scoped.cacheHits, "hit")} · ${formatBytes(scoped.cacheBytesSaved)} saved` },
-    )
-    return rows
 }
 
-function liveSegments(live: LiveProcess): BytesSegments {
-    return [
-        { label: "Returned to context", value: live.bytesReturned, className: "cm-seg-returned" },
-        { label: "Kept out", value: live.keptOut, className: "cm-seg-kept" },
-    ]
-}
-
-function scopedSegments(scoped: Aggregate): BytesSegments {
-    return [
-        { label: "Returned to context", value: scoped.bytesReturned, className: "cm-seg-returned" },
-        { label: "Kept out", value: scoped.keptOut, className: "cm-seg-kept" },
-    ]
-}
-
-// -------------------------------------------------------------------- format
-
-function formatTokens(tokens: number): string {
-    const value = Math.max(0, Math.round(tokens))
-    if (value >= 1_000_000_000) return `${(value / 1_000_000_000).toFixed(1)}`.replace(/\.0$/, "") + "B"
-    if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}`.replace(/\.0$/, "") + "M"
-    if (value >= 1000) return `${(value / 1000).toFixed(1)}`.replace(/\.0$/, "") + "K"
-    return String(value)
-}
-
-function formatBytes(bytes: number): string {
-    const value = Math.max(0, bytes)
-    if (value >= 1_073_741_824) return `${(value / 1_073_741_824).toFixed(1)} GB`
-    if (value >= 1_048_576) return `${(value / 1_048_576).toFixed(1)} MB`
-    if (value >= 1024) return `${(value / 1024).toFixed(1)} KB`
-    return `${Math.round(value)} B`
-}
-
-/** "$12.40 – $61.99": cache-read lower bound, full-input upper bound. */
-function formatDollarRange(pricing: PricingResult): string {
-    const min = formatDollars(pricing.dollarsMin)
-    const max = formatDollars(pricing.dollarsMax)
-    return min === max ? min : `${min} – ${max}`
-}
-
-function pricingTitle(pricing: PricingResult): string {
-    const coverage = Math.round(pricing.coverage * 100)
-    return (
-        `Value of saved tokens at your models' real rates (models.dev).\n` +
-        `Lower bound: cache-read rates. Upper bound: full input rates.\n` +
-        `Rate coverage: ${coverage}% of the window's model mix.`
-    )
-}
-
-function formatDollars(dollars: number): string {
-    if (!Number.isFinite(dollars) || dollars <= 0) return "$0.00"
-    if (dollars < 0.01) return "<$0.01"
-    if (dollars >= 1000) return `$${Math.round(dollars).toLocaleString("en-US")}`
-    return `$${dollars.toFixed(2)}`
-}
-
-function formatDuration(ms: number): string {
-    const safe = Math.max(0, Math.round(ms))
-    if (safe < 1000) return `${safe} ms`
-    const totalSeconds = safe / 1000
-    if (totalSeconds < 60) return `${totalSeconds.toFixed(1)} s`
-    const wholeSeconds = Math.floor(totalSeconds)
-    const hours = Math.floor(wholeSeconds / 3600)
-    const minutes = Math.floor((wholeSeconds % 3600) / 60)
-    if (hours > 0) return `${hours}h ${minutes}m`
-    return `${minutes}m ${wholeSeconds % 60}s`
-}
-
-function plural(count: number, noun: string): string {
-    return count === 1 ? `1 ${noun}` : `${count} ${noun}s`
-}
-
-// -------------------------------------------------------------------- wiring
-
-host.onReady((ctx: HostReadyContext) => {
-    applyHostReady(ctx, document.documentElement)
-    surface = ctx.surface === "status" ? "status" : "panel"
-    if (!mounted) {
-        mounted = true
-        if (surface === "status") mountStatus()
-        else mountPanel()
-        startPolling()
+async function loadProjects(): Promise<void> {
+    try {
+        const o = await api<OverviewPayload>("/v1/overview", { filter: { subagents: true }, topN: 100 })
+        projectOptions = [{ id: "", label: "All projects" }, ...o.projectsTop
+            .slice()
+            .sort((a, b) => b.lastEventAt - a.lastEventAt)
+            .map((p) => ({ id: p.dir, label: p.name, hint: `${p.sessions}` }))]
+        if (view.project && !projectOptions.some((p) => p.id === view.project)) projectOptions.push({ id: view.project, label: view.project })
+        syncChrome()
+    } catch {
+        // the filter keeps its previous options
     }
-    void refreshStats()
+}
+
+function schedulePoll(): void {
+    if (pollTimer !== null) window.clearInterval(pollTimer)
+    pollTimer = null
+    const sec = settings.display.refreshSec
+    if (!sec) return
+    pollTimer = window.setInterval(() => {
+        if (document.hidden || rendering) return
+        if (surface !== "status" && view.view === "settings") return
+        if (Date.now() - lastRenderAt < sec * 1000 - 200) return
+        void render({ keepScroll: true })
+    }, Math.max(1000, sec * 1000))
+}
+
+// ------------------------------------------------------------------- boot
+
+/** Deep link for development and tests: `index.html#view=runs&session=ses_…&range=30d`. The host never sets it. */
+function hashView(): Partial<ViewState> {
+    const p = new URLSearchParams(location.hash.slice(1))
+    const out: Partial<ViewState> = {}
+    const v = p.get("view")
+    if (v && ["sessions", "insights", "runs", "knowledge", "settings"].includes(v)) out.view = v as View
+    const r = p.get("range")
+    if (r && r in RANGE_LABELS) out.range = r as RangeKey
+    const s = p.get("session")
+    if (s) {
+        out.view = "sessions"
+        out.sessionId = s
+    }
+    return out
+}
+
+host.onSession((session) => {
+    const id = session?.id ?? null
+    if (id === current.sessionId) return
+    current.sessionId = id
+    if (mounted) void render({ keepScroll: true })
 })
 
-host.onSessionLifecycle(() => {
-    void refreshStats()
+host.onDirectory((directory) => {
+    if (directory === current.directory) return
+    current.directory = directory
+    if (mounted && surface === "status") void render({ keepScroll: true })
+})
+
+host.onReady((ctx) => {
+    applyHostReady(ctx, document.documentElement)
+    applyScale()
+    if (mounted) return
+    mounted = true
+    surface = ctx.surface
+    current.sessionId = ctx.session?.id ?? null
+    current.directory = ctx.directory
+    document.documentElement.dataset.surface = surface
+    void (async () => {
+        try {
+            const stored = await host.storage.get(STORAGE_KEY)
+            if (stored !== undefined) settings = normalize(stored)
+        } catch {
+            // defaults
+        }
+        applyScale()
+        view = { ...initialView(settings), ...hashView() }
+        if (surface !== "status") {
+            mountPanel()
+            void loadProjects()
+            window.setInterval(() => { if (!document.hidden) void loadProjects() }, 60_000)
+        }
+        await render({ keepScroll: false })
+        schedulePoll()
+    })()
+})
+
+document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && mounted && Date.now() - lastRenderAt > 2000) void render({ keepScroll: true })
 })

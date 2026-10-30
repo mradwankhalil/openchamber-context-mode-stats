@@ -1,3 +1,8 @@
 node_modules/
 *.log
 .DS_Store
+# local tool state and screenshots (may contain your own session data)
+.openchamber/
+.omo/
+.impeccable/
+sub-agents-reports/

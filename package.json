@@ -1,9 +1,14 @@
 {
-    "name": "openchamber-context-mode-stats",
-    "version": "0.1.0",
+    "name": "openchamber-context-mode",
+    "version": "1.0.0",
     "private": true,
     "type": "module",
-    "description": "OpenChamber extension: context-mode savings stats in a side panel",
+    "description": "OpenChamber extension: everything context-mode records for OpenCode, per session and across runs",
+    "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/mradwankhalil/openchamber-context-mode-stats.git"
+    },
     "openchamber": {
         "apiVersion": 1,
         "engines": {
@@ -12,14 +17,15 @@
         "contributes": {
             "panel": {
                 "id": "context-mode-stats",
-                "name": "Context Mode Stats",
+                "name": "Context Mode",
                 "icon": "icon.svg",
                 "entry": "panel/index.html"
             },
+            "page": true,
             "statusSection": {
                 "entry": "panel/index.html",
                 "title": "Context Mode",
-                "height": 84
+                "height": 120
             },
             "service": {
                 "entry": "service/main.js",
@@ -32,10 +38,12 @@
         "build:panel": "bunx openchamber-guest-bundle panel/main.ts panel/main.js",
         "build:service": "bunx openchamber-guest-bundle --node service/main.ts service/main.js",
         "typecheck": "tsc --noEmit",
-        "smoke": "node scripts/smoke.mjs"
+        "test": "node --no-warnings --test test/*.test.ts",
+        "smoke": "node --no-warnings scripts/smoke.ts",
+        "dev": "node --no-warnings dev/server.ts"
     },
     "dependencies": {
-        "@openchamber/sdk": "^2.1.0"
+        "@openchamber/sdk": "^2.3.3"
     },
     "devDependencies": {
         "@types/node": "^25.5.0",

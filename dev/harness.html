@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Context Mode — dev harness</title>
+<style>
+    body { margin: 0; font: 13px system-ui, sans-serif; background: #0b0b0c; color: #ddd; }
+    body.light { background: #e9e9ec; color: #222; }
+    header { display: flex; gap: 14px; align-items: center; padding: 8px 12px; border-bottom: 1px solid #333; }
+    header label { display: inline-flex; gap: 6px; align-items: center; }
+    .stage { display: flex; gap: 16px; padding: 16px; align-items: flex-start; }
+    .frame { display: grid; gap: 6px; }
+    .frame span { opacity: 0.7; }
+    iframe { border: 1px solid #333; border-radius: 10px; background: transparent; }
+    #log { position: fixed; right: 10px; bottom: 10px; max-width: 420px; display: grid; gap: 6px; }
+    #log div { background: #222; color: #eee; padding: 6px 10px; border-radius: 6px; }
+</style>
+</head>
+<body>
+<header>
+    <b>Context Mode harness</b>
+    <label>Layout <select id="layout"><option value="rail">rail 420</option><option value="page">page</option><option value="status">status card</option><option value="all">all three</option></select></label>
+    <label>Theme <select id="theme"><option>dark</option><option>light</option></select></label>
+    <label>Session id <input id="sid" size="34" placeholder="ses_… (this chat)"></label>
+    <button id="apply">Apply</button>
+</header>
+<div class="stage" id="stage"></div>
+<div id="log"></div>
+<pre id="debug" style="padding:0 16px;font-size:11px;white-space:pre-wrap"></pre>
+<script>
+const CH = "openchamber.sdk"
+const THEMES = {
+    dark: { background: "#111113", elevated: "#1a1a1d", foreground: "#ececef", muted: "#a0a0a8", subtle: "#6e6e76", border: "#2c2c31", hover: "#202024", selection: "#2a3448", focus: "#7aa7ff", primary: "#e0a15a", mutedSurface: "#18181b", elevatedForeground: "#ececef", active: "#26262b", selectionForeground: "#ffffff", primaryForeground: "#1a1206", primaryText: "#f0b672", successText: "#7fd49b", warningText: "#e8c46a", errorText: "#ff8a80", infoText: "#8ab4ff", success: "#3fae6a", warning: "#d6a636", error: "#e5534b", info: "#4c8dff", font: "Inter, Segoe UI, system-ui, sans-serif", mono: "JetBrains Mono, Consolas, monospace", radius: "8px" },
+    light: { background: "#ffffff", elevated: "#ffffff", foreground: "#1b1b1f", muted: "#5f5f68", subtle: "#8b8b94", border: "#dcdce2", hover: "#f2f2f5", selection: "#dce7ff", focus: "#2f6fe0", primary: "#c7711c", mutedSurface: "#f5f5f7", elevatedForeground: "#1b1b1f", active: "#e8e8ed", selectionForeground: "#111111", primaryForeground: "#ffffff", primaryText: "#a85a0e", successText: "#1d7a43", warningText: "#8a6100", errorText: "#b42318", infoText: "#1d5bd6", success: "#2e9d5b", warning: "#c99415", error: "#d92d20", info: "#2f6fe0", font: "Inter, Segoe UI, system-ui, sans-serif", mono: "JetBrains Mono, Consolas, monospace", radius: "8px" },
+}
+const q = new URLSearchParams(location.search)
+const layout = q.get("layout") || "rail"
+const theme = q.get("theme") || "dark"
+const sid = q.get("sid") || ""
+const fh = Number(q.get("h") || 0)
+document.getElementById("layout").value = layout
+document.getElementById("theme").value = theme
+document.getElementById("sid").value = sid
+document.body.classList.toggle("light", theme === "light")
+document.getElementById("apply").onclick = () => {
+    const p = new URLSearchParams({ layout: document.getElementById("layout").value, theme: document.getElementById("theme").value, sid: document.getElementById("sid").value })
+    location.search = p.toString()
+}
+const log = (m) => { const d = document.createElement("div"); d.textContent = m; document.getElementById("log").appendChild(d); setTimeout(() => d.remove(), 4000) }
+const frames = new Map()
+function addFrame(surface, w, hgt) {
+    const wrap = document.createElement("div"); wrap.className = "frame"
+    const label = document.createElement("span"); label.textContent = `${surface} ${w}×${hgt}`
+    const f = document.createElement("iframe"); f.src = "/panel/index.html" + (q.get("hash") ? "#" + q.get("hash") : ""); f.width = w; f.height = hgt; f.title = surface
+    f.setAttribute("sandbox", "allow-scripts")
+    wrap.append(label, f); document.getElementById("stage").appendChild(wrap)
+    frames.set(f, surface)
+}
+if (layout === "rail" || layout === "all") addFrame("panel", Number(q.get("w") || 420), fh || 900)
+if (layout === "status" || layout === "all") addFrame("status", 360, 120)
+if (layout === "page") addFrame("page", Number(q.get("w") || Math.min(1400, innerWidth - 40)), fh || innerHeight - 90)
+if (layout === "all") addFrame("page", 1100, 900)
+
+const store = JSON.parse(localStorage.getItem("cm-harness-storage") || "{}")
+const saveStore = () => localStorage.setItem("cm-harness-storage", JSON.stringify(store))
+addEventListener("message", async (e) => {
+    const m = e.data
+    if (m && m.channel === CH && q.get("debug")) { const d = document.createElement("div"); d.textContent = `msg ${m.type} ${JSON.stringify(m.payload ?? "").slice(0, 120)}`; document.getElementById("debug").appendChild(d) }
+    if (!m || m.channel !== CH) return
+    const f = [...frames.keys()].find((x) => x.contentWindow === e.source)
+    if (!f) return
+    const surface = frames.get(f)
+    const reply = (payload, ok = true, error) => e.source.postMessage(ok ? { channel: CH, v: 1, type: "result", id: m.id, ok: true, payload } : { channel: CH, v: 1, type: "result", id: m.id, ok: false, error, code: "HOST_REJECTED" }, "*")
+    switch (m.type) {
+        case "hello":
+            e.source.postMessage({ channel: CH, v: 1, type: "ready", payload: {
+                theme: { mode: theme, tokens: THEMES[theme] }, locale: "en", directory: null,
+                session: sid ? { id: sid, title: "Harness chat", busy: false } : null,
+                surface, connection: { connected: false, account: null }, settings: {}, item: null, features: { deviceStorage: true },
+            } }, "*")
+            return
+        case "service-request": {
+            try {
+                const r = await fetch("/svc" + m.payload.path, { method: m.payload.method, headers: { "content-type": "application/json" }, body: m.payload.method === "GET" ? undefined : (m.payload.body ?? "") })
+                reply({ status: r.status, body: await r.text() })
+            } catch (err) { reply(null, false, String(err)) }
+            return
+        }
+        case "storage": {
+            const p = m.payload
+            if (p.op === "get") reply({ storage: "instance", op: "get", found: p.key in store, value: store[p.key] })
+            else if (p.op === "set") { store[p.key] = p.value; saveStore(); reply({ storage: "instance", op: "set" }) }
+            else if (p.op === "delete") { delete store[p.key]; saveStore(); reply({ storage: "instance", op: "delete" }) }
+            else reply({ storage: "instance", op: "keys", keys: Object.keys(store).sort() })
+            return
+        }
+        case "resize": f.height = String(Math.max(24, Math.min(320, m.payload.height))); reply({}); return
+        case "toast": log(`toast: ${m.payload.message}`); reply({}); return
+        case "clipboard-write": log(`clipboard: ${m.payload.text}`); reply({}); return
+        default: reply({})
+    }
+})
+</script>
+</body>
+</html>

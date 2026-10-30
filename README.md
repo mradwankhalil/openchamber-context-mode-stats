@@ -1,72 +1,110 @@
-# Context Mode Stats for OpenChamber
+# Context Mode for OpenChamber
 
-An OpenChamber extension that shows what
-[context-mode](https://www.npmjs.com/package/context-mode) is saving you: the
-live process stats, scoped totals (all time / single process / day range),
-per-tool breakdowns and a daily savings series — in the extensions rail panel
-and in the chat's Work Status panel.
+An [OpenChamber](https://github.com/openchamber/openchamber) extension that shows everything
+[context-mode](https://github.com/mksglu/context-mode) records for **OpenCode**: per chat session,
+per project, across days, and live for the context-mode servers running right now.
 
-```
-Live process                          Aggregate  [All time | Today | 7d | 30d | process…]
-──────────────────────────            ──────────────────────────
-Tokens saved     ~310K                Tokens saved     ~21.6B
-Kept out         1.1 MB (66%)         Est. value       $2,570 – $40,970
-Tool calls       170                  Model mix        deepseek-v4.1-flash 44%, …
-[donut: kept out vs returned]         [donut + top tools bar chart]
+It reads context-mode's own databases and stats files (and, optionally, OpenCode's database for
+session titles and models), never writes to them, and labels the one number context-mode only
+estimates.
 
-Tokens saved per day
-[column chart]
-```
+## What you get
 
-## What it reads
+**Sessions.** A statement of the filtered set (sessions, projects, prompts, model steps, tokens
+the model read and generated, cache share, peak context, errors, retry loops, decisions,
+compactions, context-mode tool traffic), a daily activity chart with six metrics (click a day to
+filter to it), and a sortable ledger of sessions with title, project, model and subagent links.
 
-The per-process stats files context-mode writes to
-`<config>/opencode/context-mode/sessions/stats-pid-*.json`. Every candidate
-store location is scanned (XDG config home, `~/.config`, `.opencode-v2`) and
-files are deduped by pid + session start, so mirror stores never double-count.
-To pin one directory, set `CONTEXT_MODE_STATS_DIR` for the service.
+**Session detail.** The context curve: prompt size of every model step, with compactions and
+sudden drops marked. Then the timeline of everything context-mode captured (filterable by type),
+prompts, files touched, recurring errors, decisions and constraints, subagents, the context-mode
+runs that overlapped the session, its knowledge base and its resume snapshots.
 
-## Scope selector
+**Insights.** When you work (weekday × hour), what happened (event mix), projects, heaviest
+sessions, models, most-touched files, shell commands, recurring errors, skills, references
+(issues and PRs), retry loops and intents.
 
-The aggregate section header is a picker: **All time**, **Today**, **Last 7
-days**, **Last 30 days**, or any individual context-mode process. Metrics,
-donut, tool bars and the daily series all follow the selection.
+**Runs.** Each context-mode MCP server: tool calls by tool, bytes returned into context, bytes
+indexed instead, bytes read inside the sandbox, and context-mode's own "tokens saved" estimate,
+hatched and explained.
 
-## How dollar figures are computed
+**Knowledge.** context-mode's FTS knowledge bases: databases per project, what was indexed (command
+output, fetched pages, files), sources and chunks per day, every source.
 
-context-mode's own flat $5/1M estimate is **not** shown. Instead the service
-prices saved tokens at your models' real rates:
+**In the chat.** A Work Status card for the open chat: current and peak context, the last 40
+steps' prompt sizes, prompts, steps, tokens, errors, compactions, and the live server's traffic.
 
-- **Model mix** — OpenCode's `opencode.db` (opened read-only) records every
-  session's model and token usage; the mix for the selected window is weighted
-  by input-side tokens (input + cache read), because kept-out bytes would have
-  been prompt tokens.
-- **Rates** — [models.dev](https://models.dev) `api.json`, cached on disk for
-  24 h at `~/.config/openchamber/context-mode-stats-pricing.json`.
+Everything follows one filter bar (date range, project, search), the OpenChamber theme, and
+your text size.
 
-Saved tokens are prompt-side, so the value is a range: the lower bound prices
-every saved token at cache-read rates, the upper bound at full input rates.
-Hover the figure for the basis and rate coverage. If the database is missing
-or no model matches a rate, dollar rows are simply omitted. Set
-`OPENCODE_DB_PATH` to point at a specific database file.
+## What the numbers mean
+
+| Number | Meaning |
+|---|---|
+| Model steps | One per model call (context-mode's `agent_usage` events), de-duplicated across databases. |
+| Tokens read | Input + cache read + cache write, summed over steps: what the model actually read. |
+| Peak context | The largest single prompt of any step: how full the context window got. |
+| From cache | Cache read ÷ tokens read. |
+| Returned to context | Bytes context-mode's tools put into the conversation. Measured. |
+| Indexed | Bytes written to the knowledge base instead of the conversation. Measured. |
+| Read in the sandbox | Bytes code run by `ctx_execute` read from disk or the network. Measured. |
+| Tokens "saved" (est.) | context-mode's formula: (indexed + sandbox reads + cache) ÷ 4. It counts every byte a script touches as if it would have entered the context, so treat it as an upper bound. |
+
+Every figure has an info hover with its definition, and Settings → About the numbers lists them
+all. [DESIGN.md](DESIGN.md) documents the stores and the reasoning in full.
 
 ## Install
 
-In OpenChamber, open **Settings → Extensions**, add this repo (or a local
-folder path), and approve the dialog — it includes **Run a local service**,
-which is what reads the stats. The chart icon then appears on the extensions
-rail; the "Context Mode" section is available in the chat's Work Status panel
-section list.
+1. In OpenChamber open **Settings → Extensions** and add this repository (or a local clone).
+2. Approve the dialog. It asks to **run a local service**: that is the process that reads the
+   databases. Nothing else is requested.
+3. Open the brain icon on the extensions rail, or **Extension pages → Context Mode** for a full
+   page. The **Context Mode** section appears in the chat's Work Status panel.
+
+Requirements: OpenChamber 2.0.4 or newer, context-mode installed for OpenCode. Session and
+knowledge-base views need `node:sqlite`, which current OpenChamber builds ship (Node 22.5+).
+
+## Settings
+
+- **Locations.** Every store is found automatically from your home folder and shown with its
+  status, file count, size and last update. If something is missing, set the context-mode data
+  folder (the same thing `CONTEXT_MODE_DATA_DIR` points at), individual folders for session
+  databases, run stats files and knowledge bases, or the path to OpenCode's `opencode.db`.
+- **Privacy.** Show or hide event text (prompts, errors, decisions, commands); shorten file
+  paths. The eye button in the header toggles event text for screen sharing.
+- **Data.** Hide test sessions, include or exclude subagents, exclude projects by pattern, show
+  or hide context-mode's estimate.
+- **Display.** Text size (14–18 px), refresh interval, opening view, default range, items in
+  every ranked list, rows per page, timeline page size, and which ledger columns to show.
 
 ## Develop
 
-OpenChamber never compiles an extension: `panel/main.js` and
-`service/main.js` are built and committed. Rebuild and commit them with every
-change.
+OpenChamber runs the built files as they are, so `panel/main.js` and `service/main.js` are
+committed. Rebuild them with every change.
 
-```
+```sh
 bun install
-bun run build      # bundles panel/main.js and service/main.js
+bun run build       # panel/main.js and service/main.js
 bun run typecheck
-node scripts/smoke.mjs
+bun run test        # node --test against fixture databases
+bun run smoke       # read-only run against the stores on this machine
+bun run dev         # http://127.0.0.1:5178 — the real panel and service in a fake host
 ```
+
+The dev harness emulates the OpenChamber host (theme, storage, service proxy) and offers rail,
+page and Work Status layouts in dark and light. `#view=runs`, `#range=30d` or
+`#session=ses_…` in the panel URL open a view directly.
+
+## Notes on context-mode
+
+Building this surfaced behaviour worth knowing when you read context-mode's own numbers:
+
+- each model-step usage event is written into every project database the session's plugin has
+  open, so naive sums count steps many times over;
+- two context-mode servers started by the same parent process write the same
+  `stats-pid-<ppid>.json` and overwrite each other's counters;
+- `tokens_saved` counts sandbox file and network reads as saved context.
+
+## License
+
+MIT
