@@ -4,9 +4,14 @@ This document explains how the extension works and why it looks the way it does:
 context-mode actually stores, what those numbers can and cannot support, how the service
 turns them into answers, and the visual system of the panel.
 
-## 1. What context-mode stores for OpenCode
+## 1. What context-mode v1 stores for OpenCode
 
-context-mode has two halves in OpenCode, and they write to different places.
+The readers target the formats present in upstream context-mode 1.0.169. This is the
+context-mode **v1 engine**, independently of whether OpenCode itself is V1 or V2. The
+context-mode v2 engine rewrite uses different locations/tables/accounting and is not supported.
+The extension reads existing stores; it does not install the integration that produces them.
+
+context-mode has two halves in OpenCode, and they can write to different places.
 
 | Store | Written by | Location (default) | What is in it |
 |---|---|---|---|
@@ -15,47 +20,69 @@ context-mode has two halves in OpenCode, and they write to different places.
 | Knowledge-base DBs | the MCP server | `~/.config/opencode/context-mode/content/<hash>.db` | FTS5 index; the `sources` table lists what was indexed and how many chunks it produced |
 | OpenCode DB (optional) | OpenCode | `~/.local/share/opencode/opencode.db` | session titles, parent (subagent) links, agent, model, OpenCode's own token totals |
 
-`<hash>` is a hash of the project directory; `__<wt>` marks a git worktree. `CONTEXT_MODE_DATA_DIR`
-moves all three context-mode stores.
+`<hash>` is a hash of the project directory; `__<wt>` marks a git worktree. Upstream v1's
+override is `CONTEXT_MODE_DIR`, with `sessions` and `content` beneath it. The extension does
+not read that override from an agent's shell. Its shared root setting expects the standard
+`context-mode/{sessions,content}` layout; for an arbitrarily named root, set the individual
+session/stat/content folders. OpenCode enrichment selects one database, not every profile.
 
 ### Facts discovered while building this (they shape the code)
 
-1. **Model steps are duplicated across DBs.** context-mode writes each `agent_usage` event into
-   every project DB the plugin instance has open. On the author's machine a single session's
+1. **Historical local capture duplicated usage across DBs.** An older locally patched OpenCode
+   V2 `StepEnded` writer handled broadcast events without project ownership checks. On the author's machine a single session's
    136 steps appeared in 15 DBs; about 300k step rows held 71k real steps. The service merges a
    session across DBs and de-duplicates steps on (time, input, output, cache read, cache write).
-   Ordinary events are not duplicated: they live in the session's home DB.
-2. **`tokens_saved` is an upper bound, not a saving.** In context-mode's source,
+   This is not proof of universal upstream fan-out. Matching samples are not stable step IDs:
+   legitimate identical samples can merge, and the reader does not repair writer ownership.
+2. **`tokens_saved` is a byte-based estimate, not measured savings.** In context-mode v1's source,
    `tokens_saved = (bytes_indexed + bytes_sandboxed + cache_bytes_saved) / 4`, and
    `bytes_sandboxed` counts every byte sandboxed code reads from disk or the network. A script
    that reads a 100 MB SQLite file to count rows adds 25M "saved" tokens. One process on the
    author's machine reported 3.3 billion tokens saved from 76 calls. The panel shows this figure
    only as a hatched, labelled estimate and explains it on the Runs view.
-3. **Two MCP servers can share one stats file.** The file is named after the parent process id.
+3. **Two MCP servers can share one stats file.** Stock v1 normally names it after the parent
+   process id (a session-ID override can produce other names, which this reader does not discover).
    When OpenCode starts two context-mode servers under one parent, both write
    `stats-pid-<ppid>.json` and overwrite each other, so the "live" numbers flip between them.
-   The service remembers every run it has seen while it is running and treats all live servers
-   together.
-4. **The per-step prompt size is the real context signal.** `tokens_in + cache_read +
-   cache_create` of a step is exactly what the model read. Its maximum is the session's peak
-   context; its series is the context curve; a drop by half or more after a large prompt marks a
+   The service remembers only runs it actually observes during its own lifetime. Unseen
+   overwrites are unrecoverable and this memory is lost on restart. Parent-PID existence plus
+   freshness is an approximate live indicator, not proof of the child server's identity.
+4. **Recorded prompt size is a capture-dependent context signal.** `tokens_in + cache_read +
+   cache_create` gives the recorded sample's input-plus-cache size. Its maximum and series are
+   the displayed peak and curve, not proof of the actual peak when samples are absent.
+   Stock OpenCode V1 capture records message updates, not necessarily one row per model call.
+   A per-step producer improves granularity; a drop after a large prompt can indicate a
    compaction, a reset, or a smaller side call.
 
 ## 2. What the data supports
 
-Measured, and shown as plain figures:
+Recorded data, shown as plain figures when available, rather than independently measured
+activity from every host/provider:
 
 - sessions, projects, subagents (with OpenCode's DB), prompts, events by type, errors and
   resolutions, retry loops, decisions, blockers, constraints, compactions, resume snapshots;
-- model steps and their tokens: read (input + cache), generated, cache share, peak and latest
-  context, provider-reported cost when the provider reports one;
+- usage samples and their recorded tokens: read (input + cache), generated, cache share, peak
+  and latest sample size; cost as stored by the producer. Upstream may price tokens when native
+  cost is absent, and message-update cost may be cumulative. The reader does not preserve cost
+  provenance or difference cumulative updates; these totals are not audited billing;
 - files read and edited, shell commands, skills, references, intents, models, agents;
 - context-mode's own tool calls and the bytes they returned into context, indexed, or read in
   the sandbox; knowledge-base sources, chunks, sizes.
 
-Estimated, and always marked:
+The estimate explicitly marked by the interface:
 
 - context-mode's `tokens_saved`. No dollar value is derived from it.
+
+Missing capture and unsupported tables can return empty lists or zero counters; some DB read
+errors are internally retained or skipped rather than exposed in every view. Such displays do
+not prove zero activity/cost. Missing SQLite is reported in Settings → Locations, but there is
+not yet a comprehensive schema/capability warning for every unavailable field. Model labels,
+titles and subagent links need matching optional OpenCode DB columns, not merely usage rows.
+
+Basic readers need no author-specific fork. New native OpenCode V2 capture needs a compatible
+V2 adapter; stock context-mode 1.0.169's V1 plugin does not supply that API. The local adapter
+adds native step-ended capture, with bounded early-event retention; it is not shipped by this
+extension and does not make the context-mode v2 engine's stores compatible.
 
 Not available from these stores, so not shown: a per-call log of context-mode tools (the
 `tool_calls` table exists but stays empty), and which chat a context-mode tool call came from
@@ -79,6 +106,10 @@ panel (sandboxed iframe) ── host.serviceRequest ──▶ OpenChamber ──
 - **Targeted SQL for depth.** Session detail and ranked insights query just the DBs involved,
   with privacy applied in the service so hidden text never leaves it.
 - **Read-only.** Every database is opened read-only and closed after use.
+- **Host runtime.** SQLite is loaded from OpenChamber's service runtime, not a separately
+  installed Node on PATH. The constructor uses `readOnly` and `timeout`: Node 22.16+ on the
+  22.x line or Node 24+ with `node:sqlite` enabled covers those options. Node 22.5 alone is not
+  sufficient evidence of unflagged availability or the documented timeout behavior.
 
 Files: `service/discover.ts` (locations), `service/events.ts` (session index and merge),
 `service/runs.ts` (run files), `service/knowledge.ts` (FTS sources), `service/opencode.ts`
