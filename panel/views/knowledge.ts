@@ -63,7 +63,7 @@ export const renderKnowledge: ViewRenderer = async (app, el, isStale) => {
             label: d.projectDir ? d.projectDir.replace(/\\/g, "/").split("/").filter(Boolean).slice(-2).join("/") : d.hash,
             value: d.bytes,
             display: bytes(d.bytes),
-            sub: `${full(d.sources)} sources · ${full(d.chunks)} chunks · last ${ago(d.newestAt)}`,
+            sub: `${full(d.sources)} sources · ${full(d.chunks)} chunks · last ${ago(d.newestAt)} · in ${d.dir.replace(/\\/g, "/").split("/").filter(Boolean).slice(-4, -2).join("/")}`,
             title: d.file,
         })), { empty: "No knowledge-base databases found. Check Settings → Locations." })),
         section("Sources", sortSeg, p.sourcesTotal ? sources : h("p.muted", null, app.view.q ? `No source matches “${app.view.q}”.` : "No sources in this range."),

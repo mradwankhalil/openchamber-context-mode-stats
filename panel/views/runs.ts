@@ -120,7 +120,7 @@ export const renderRuns: ViewRenderer = async (app, el, isStale) => {
                     splitBar([
                         { label: "Returned to context (measured)", value: a.bytesReturned, tone: "--t-returned" },
                         { label: "Indexed instead (measured)", value: a.bytesIndexed, tone: "--t-indexed" },
-                        { label: "Read inside the sandbox", value: a.bytesSandboxed, tone: "--t-sandbox", hatched: true, note: "counted as “saved” by context-mode" },
+                        { label: "Read inside the sandbox (measured)", value: a.bytesSandboxed, tone: "--t-other", note: "context-mode counts these bytes as “saved”" },
                         { label: "Served from fetch cache", value: a.cacheBytesSaved, tone: "--t-cache" },
                     ], bytes))),
                 card(h("div.section", null, h("div.section-head", null, h("h2", null, "Calls per day"), h("span.hint", null, "by run start")),

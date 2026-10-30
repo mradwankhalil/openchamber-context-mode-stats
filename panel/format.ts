@@ -10,7 +10,8 @@ export function count(n: number): string {
     if (a < 10_000) return nf0.format(n)
     if (a < 1e6) return `${nf1.format(n / 1e3)}K`
     if (a < 1e9) return `${nf1.format(n / 1e6)}M`
-    return `${nf1.format(n / 1e9)}B`
+    // "bn", not "B": B already means bytes elsewhere on the same screen.
+    return `${new Intl.NumberFormat(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 1 }).format(n / 1e9)}bn`
 }
 
 export const full = (n: number): string => (Number.isFinite(n) ? nf0.format(n) : "–")

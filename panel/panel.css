@@ -3,11 +3,11 @@
    additions are category tones and the hatch that marks every estimate. */
 
 :root {
-    --fs-xs: 0.78rem;
-    --fs-sm: 0.87rem;
+    --fs-xs: 0.87rem;
+    --fs-sm: 0.94rem;
     --fs-md: 1rem;
-    --fs-lg: 1.14rem;
-    --fs-num: 1.36rem;
+    --fs-lg: 1.16rem;
+    --fs-num: 1.5rem;
     --fs-title: 1.3rem;
     --gap: 12px;
     --r: min(var(--oc-radius, 8px), 10px);
@@ -157,6 +157,9 @@ main.view { padding: 14px 16px 40px; display: grid; gap: 22px; }
 .hatch-bg { fill: color-mix(in oklab, var(--est) 25%, transparent); }
 .hatch-line { stroke: var(--est); stroke-width: 1.6; }
 .col:hover .col-bar, .col:focus .col-bar { opacity: 1; }
+.col.selected .col-bar { opacity: 1; stroke: var(--oc-fg); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.ev-repeat { margin-left: 6px; color: var(--text-2); font-weight: 500; }
+.trail-caption { display: flex; justify-content: space-between; font-size: var(--fs-xs); color: var(--text-2); font-variant-numeric: tabular-nums; }
 .col:hover .col-hit, .col:focus .col-hit { fill: color-mix(in oklab, var(--oc-fg) 6%, transparent); }
 .col { cursor: pointer; outline: none; }
 .cols-axis { position: relative; height: 20px; margin-top: 4px; font-size: var(--fs-xs); color: var(--text-2); }
@@ -214,7 +217,7 @@ main.view { padding: 14px 16px 40px; display: grid; gap: 22px; }
 
 /* ----------------------------------------------------------------- ledger */
 
-.ledger { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
+.ledger { width: 100%; border-collapse: collapse; font-size: var(--fs-md); }
 .ledger th { position: sticky; top: var(--sticky-top, 53px); z-index: 2; background: var(--oc-bg); text-align: right; font-weight: 550; color: var(--text-2); padding: 8px 10px; border-bottom: 1px solid var(--oc-border); white-space: nowrap; }
 .ledger th:first-child, .ledger td:first-child { text-align: left; padding-left: 0; }
 .ledger th button { display: inline-flex; align-items: center; gap: 2px; border: 0; background: none; padding: 0; color: inherit; font: inherit; cursor: pointer; }
@@ -272,7 +275,7 @@ main.view { padding: 14px 16px 40px; display: grid; gap: 22px; }
 .ev-dot { width: 9px; height: 9px; margin-top: 6px; border-radius: 50%; background: var(--tone); }
 .ev-body { min-width: 0; }
 .ev-type { font-size: var(--fs-xs); font-weight: 650; color: var(--text-2); letter-spacing: 0.01em; }
-.ev-text { margin: 2px 0 0; font-size: var(--fs-sm); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 7.5em; overflow: hidden; position: relative; }
+.ev-text { margin: 2px 0 0; font-size: var(--fs-md); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 7.5em; overflow: hidden; position: relative; }
 .ev-text.open { max-height: none; }
 .ev-text.hidden { color: var(--text-2); font-style: italic; }
 .ev-more { font-size: var(--fs-xs); }
@@ -309,8 +312,9 @@ main.view { padding: 14px 16px 40px; display: grid; gap: 22px; }
 .toggle input { width: 18px; height: 18px; margin: 2px 0 0; accent-color: var(--accent); }
 .toggle span { font-size: var(--fs-sm); font-weight: 550; }
 .toggle small { grid-column: 2; color: var(--text-2); font-size: var(--fs-xs); }
-.loc-table td, .loc-table th { white-space: normal; }
-.loc-table td.path { text-align: left; font-family: var(--oc-mono, monospace); font-size: 0.82rem; overflow-wrap: anywhere; min-width: 200px; }
+.loc-table td, .loc-table th { white-space: nowrap; }
+.loc-table td:first-child { white-space: normal; }
+.loc-table td.path { white-space: normal; text-align: left; font-family: var(--oc-mono, monospace); font-size: 0.82rem; overflow-wrap: anywhere; min-width: 200px; }
 .loc-table tbody tr { cursor: default; }
 .save-bar { position: sticky; bottom: 0; display: flex; align-items: center; gap: 10px; justify-content: flex-end; padding: 12px 0; background: linear-gradient(to top, var(--oc-bg) 70%, transparent); }
 .glossary { display: grid; gap: 10px; margin: 0; }

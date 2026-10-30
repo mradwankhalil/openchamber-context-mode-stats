@@ -62,7 +62,7 @@ export interface ColumnDatum {
 }
 
 /** Daily columns with a baseline, a max label and sparse day labels. Fills its container width. */
-export function dailyColumns(data: ColumnDatum[], opts: { height?: number; unit?: (n: number) => string; onPick?: (day: string) => void; extraHatched?: boolean } = {}): HTMLElement {
+export function dailyColumns(data: ColumnDatum[], opts: { height?: number; unit?: (n: number) => string; onPick?: (day: string) => void; extraHatched?: boolean; selected?: string } = {}): HTMLElement {
     const unit = opts.unit ?? count
     const height = opts.height ?? 132
     const wrap = h("div.cols")
@@ -80,7 +80,7 @@ export function dailyColumns(data: ColumnDatum[], opts: { height?: number; unit?
         const w = Math.max(0.6, bw * 0.7)
         const vh = (d.value / max) * (H - 4)
         const eh = ((d.extra ?? 0) / max) * (H - 4)
-        const g = s("g", { class: "col", tabindex: 0 })
+        const g = s("g", { class: d.day === opts.selected ? "col selected" : "col", tabindex: 0 })
         g.appendChild(s("rect", { x: i * bw, y: 0, width: bw, height: H, class: "col-hit" }))
         if (vh > 0) g.appendChild(s("rect", { x, y: H - vh, width: w, height: Math.max(vh, 0.8), class: "col-bar" }))
         if (eh > 0) g.appendChild(s("rect", { x, y: H - vh - eh, width: w, height: eh, class: opts.extraHatched ? "col-extra hatched" : "col-extra" }))
@@ -254,14 +254,22 @@ export function splitBar(parts: Part[], format: (n: number) => string = count): 
 
 // ------------------------------------------------------------------- trail
 
-/** Bars for the last N model steps' prompt size, for the Work Status card. */
+/**
+ * Bars for the last N model steps' prompt size, for the Work Status card.
+ * Scaled between the window's smallest and largest prompt (labelled
+ * underneath), so growth inside a large context stays visible.
+ */
 export function trail(values: number[], height = 30): HTMLElement {
     const max = Math.max(1, ...values)
-    const wrap = h("div.trail", { style: `height:${height}px`, role: "img", "aria-label": "Context size of recent model steps" })
+    const min = Math.min(...values)
+    const floor = Math.max(0, min - (max - min) * 0.15)
+    const span = Math.max(1, max - floor)
+    const bars = h("div.trail", { style: `height:${height}px`, role: "img", "aria-label": `Prompt size of the last ${values.length} model steps, from ${count(min)} to ${count(max)}` })
+    const wrap = h("div", null, bars, h("div.trail-caption", null, h("span", null, `last ${values.length} steps`), h("span", null, `${count(min)} → ${count(max)} tokens`)))
     values.forEach((v, i) => {
-        const b = h("span", { style: `height:${Math.max(6, (v / max) * 100)}%`, class: i === values.length - 1 ? "now" : "" })
+        const b = h("span", { style: `height:${Math.max(8, ((v - floor) / span) * 100)}%`, class: i === values.length - 1 ? "now" : "" })
         hoverable(b, () => tipRows(`Step ${values.length - i === 1 ? "(latest)" : `−${values.length - i - 1}`}`, [["prompt tokens", count(v)]]))
-        wrap.appendChild(b)
+        bars.appendChild(b)
     })
     return wrap
 }

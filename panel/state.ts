@@ -175,3 +175,8 @@ export function filterOf(v: ViewState, s: UiSettings): QueryFilter {
 export const RANGE_LABELS: Record<RangeKey, string> = {
     today: "Today", "7d": "7 days", "30d": "30 days", "90d": "90 days", all: "All time", custom: "Custom",
 }
+
+/** Compact labels for the filter bar, so the whole control fits a narrow rail. */
+export const RANGE_SHORT: Record<RangeKey, string> = {
+    today: "Today", "7d": "7d", "30d": "30d", "90d": "90d", all: "All", custom: "Custom",
+}

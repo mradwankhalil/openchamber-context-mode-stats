@@ -13,7 +13,7 @@ type Tab = "timeline" | "prompts" | "files" | "errors" | "decisions" | "subagent
 let tab: Tab = "timeline"
 const openTexts = new Set<number>()
 
-function eventItem(e: TimelineEvent): HTMLElement {
+function eventItem(e: TimelineEvent, repeats = 1): HTMLElement {
     const text = e.text
     const body = text === null
         ? h("p.ev-text.hidden", null, "Hidden — event text is off in Settings → Privacy.")
@@ -34,7 +34,7 @@ function eventItem(e: TimelineEvent): HTMLElement {
     return h("li.ev", { style: `--tone:var(${typeTone(e.type)})` },
         h("span.ev-time", { title: dateTime(e.at) }, time(e.at)),
         h("span.ev-dot"),
-        h("div.ev-body", null, h("div.ev-type", null, typeLabel(e.type), e.bytes ? ` · ${bytes(e.bytes)}` : ""), body, more))
+        h("div.ev-body", null, h("div.ev-type", null, typeLabel(e.type), e.bytes ? ` · ${bytes(e.bytes)}` : "", repeats > 1 ? h("span.ev-repeat", { title: `${repeats} identical events in a row` }, `×${repeats}`) : null), body, more))
 }
 
 function timeline(app: App, d: SessionDetail): HTMLElement {
@@ -65,8 +65,19 @@ function timeline(app: App, d: SessionDetail): HTMLElement {
         h("p.muted", { style: "margin:0;font-size:var(--fs-sm)" }, d.timelineTotal
             ? `Newest first · ${full(v.timelineOffset + 1)}–${full(shown)} of ${full(d.timelineTotal)} ${v.timelineTypes.length ? "matching events" : "events (model steps hidden unless chosen)"}`
             : "No events of these types."),
-        h("ol.timeline", null, ...d.timeline.map(eventItem)),
+        h("ol.timeline", null, ...collapseRepeats(d.timeline).map(([e, n]) => eventItem(e, n))),
         h("div.pager", null, newer ?? h("span"), more ?? h("span")))
+}
+
+/** Consecutive events with the same type and text become one row with a count. */
+function collapseRepeats(events: TimelineEvent[]): [TimelineEvent, number][] {
+    const out: [TimelineEvent, number][] = []
+    for (const e of events) {
+        const last = out[out.length - 1]
+        if (last && last[0].type === e.type && last[0].text === e.text) last[1]++
+        else out.push([e, 1])
+    }
+    return out
 }
 
 function textList(items: TimelineEvent[], empty: string): HTMLElement {
@@ -116,7 +127,12 @@ function totals(app: App, d: SessionDetail): HTMLElement {
     const r = d.row
     const read = promptTokens(r)
     const oc = d.opencode
-    return statement([
+    const ocRead = oc ? oc.tokensInput + oc.tokensCacheRead + oc.tokensCacheWrite : 0
+    // OpenCode's totals only earn a row when they add something: a different count, a cost, or file changes.
+    const ocAdds = !!oc && (Math.abs(ocRead - read) > Math.max(1000, read * 0.02) || oc.cost > 0 || oc.summaryFiles != null)
+    const t = r.tally
+    const work = t.fileReads + t.fileEdits + t.fileWrites + t.fileSearches + t.gitOps + t.skills
+    const st = statement([
         ["Conversation", [
             { value: full(r.tally.prompts), label: "prompts", glossary: "prompts" },
             { value: full(r.usage.steps), label: "model steps", glossary: "steps" },
@@ -137,20 +153,22 @@ function totals(app: App, d: SessionDetail): HTMLElement {
             { value: full(r.tally.compactions), label: "compactions", glossary: "compactions" },
             { value: full(r.resumes), label: "resume snapshots" },
         ]],
-        ["Work", [
+        ["Work", work === 0 ? [] : [
             { value: full(r.tally.fileReads), label: "file reads" },
             { value: full(r.tally.fileEdits + r.tally.fileWrites), label: "edits & writes" },
             { value: full(r.tally.fileSearches), label: "searches" },
             { value: full(r.tally.gitOps), label: r.tally.commits ? `git ops · ${r.tally.commits} commits` : "git ops" },
             { value: full(r.tally.skills), label: "skills" },
         ]],
-        oc ? ["OpenCode", [
-            { value: count(oc.tokensInput + oc.tokensCacheRead + oc.tokensCacheWrite), label: "prompt tokens (OpenCode)" },
+        oc && ocAdds ? ["OpenCode", [
+            { value: count(ocRead), label: "prompt tokens (OpenCode)" },
             { value: count(oc.tokensOutput + oc.tokensReasoning), label: "output + reasoning" },
             oc.cost > 0 && { value: usd(oc.cost), label: "cost" },
             oc.summaryFiles != null && { value: full(oc.summaryFiles), label: `files changed (+${full(oc.summaryAdditions ?? 0)} −${full(oc.summaryDeletions ?? 0)})` },
         ]] : ["OpenCode", []],
     ])
+    if (work === 0) st.appendChild(h("p.muted", { style: "margin:8px 0 0;font-size:var(--fs-sm)" }, "No file, git or skill events were captured for this session."))
+    return st
 }
 
 function curve(d: SessionDetail): HTMLElement {
@@ -184,7 +202,7 @@ export const renderDetail: ViewRenderer = async (app, el, isStale) => {
         { id: "timeline", label: "Timeline", n: r.tally.events - r.tally.steps },
         { id: "prompts", label: "Prompts", n: r.tally.prompts },
         { id: "files", label: "Files", n: d.files.length },
-        { id: "errors", label: "Errors", n: r.tally.errors },
+        { id: "errors", label: "Tool errors", n: r.tally.errors },
         { id: "decisions", label: "Decisions", n: r.tally.decisions + r.tally.blockers + r.tally.constraints },
         ...(d.children.length ? [{ id: "subagents" as Tab, label: "Subagents", n: d.children.length }] : []),
         { id: "context-mode", label: "context-mode", n: d.runs.length },

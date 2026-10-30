@@ -168,7 +168,7 @@ export const typeLabel = (t: string): string => TYPE_LABEL[t] ?? t.replace(/_/g,
 export const TIMELINE_FILTERS: { id: string; label: string; types: string[] }[] = [
     { id: "prompts", label: "Prompts", types: ["user_prompt", "intent", "role", "data"] },
     { id: "files", label: "Files", types: ["file_read", "file_write", "file_edit", "file_search", "file_glob"] },
-    { id: "errors", label: "Errors", types: ["error_tool", "error_resolved", "retry_detected"] },
+    { id: "errors", label: "Errors & retries", types: ["error_tool", "error_resolved", "retry_detected"] },
     { id: "decisions", label: "Decisions", types: ["decision", "blocker", "blocker_resolved", "constraint_discovered"] },
     { id: "git", label: "Git", types: ["git", "git_commit"] },
     { id: "shell", label: "Shell", types: ["env", "cwd", "bash_outcome"] },

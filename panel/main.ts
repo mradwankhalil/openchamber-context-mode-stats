@@ -31,7 +31,7 @@ import type { App, ViewRenderer } from "./app.ts"
 import { hideTip } from "./charts.ts"
 import { h, icon, iconButton, replace } from "./dom.ts"
 import { bytes, duration, full } from "./format.ts"
-import { DEFAULT_SETTINGS, RANGE_LABELS, initialView, normalize } from "./state.ts"
+import { DEFAULT_SETTINGS, RANGE_LABELS, RANGE_SHORT, initialView, normalize } from "./state.ts"
 import type { RangeKey, UiSettings, View, ViewState } from "./state.ts"
 import { renderDetail } from "./views/detail.ts"
 import { renderInsights } from "./views/insights.ts"
@@ -152,7 +152,7 @@ function mountPanel(): void {
 
     const rangeSeg = h("div.seg", { role: "group", "aria-label": "Date range" })
     for (const key of ["today", "7d", "30d", "90d", "all", "custom"] as RangeKey[]) {
-        const b = h("button", { type: "button", "data-range": key }, RANGE_LABELS[key])
+        const b = h("button", { type: "button", "data-range": key, title: RANGE_LABELS[key] }, RANGE_SHORT[key])
         b.addEventListener("click", () => app.go({ range: key }))
         rangeSeg.appendChild(b)
     }

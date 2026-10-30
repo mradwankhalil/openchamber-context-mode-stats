@@ -86,6 +86,7 @@ function activityChart(app: App, o: OverviewPayload, holder: HTMLElement): void 
         h("div.section-head", null, h("h2", null, "Daily activity"), seg),
         card(dailyColumns(data, {
             unit: count,
+            selected: app.view.range === "custom" && app.view.customFrom === app.view.customTo ? app.view.customFrom : undefined,
             onPick: (day) => app.go({ range: "custom", customFrom: day, customTo: day, offset: 0 }),
         })),
         h("p.muted", { style: "margin:0;font-size:var(--fs-xs)" }, "Click a day to narrow every view to it."))
