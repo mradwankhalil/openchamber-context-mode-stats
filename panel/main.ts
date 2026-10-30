@@ -182,7 +182,7 @@ function mountPanel(): void {
     const filterbar = h("div.filterbar", null, rangeSeg, dateRange, projectHost, h("div.search", null, icon("search", 16), search))
     const notice = h("div.notice")
     const progress = h("div")
-    const main = h("main.view", { "aria-live": "polite" })
+    const main = h("main.view", { "aria-live": "polite" }, h("p.boot", null, "Loading…"))
     replace(root!, h("div.app", null, topbar, navEl, filterbar, notice, progress, main))
     refs = { liveChip, privacyBtn, refreshBtn, settingsBtn, tabs, filterbar, rangeSeg, dateRange, fromInput, toInput, project, search, notice, progress, main }
     syncChrome()
