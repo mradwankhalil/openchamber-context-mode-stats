@@ -41,7 +41,7 @@ export async function renderStatus(app: App, el: HTMLElement, isStale: () => boo
             h("span", null, h("b", null, full(s.usage.steps)), " steps"),
             h("span", null, h("b", null, count(s.usage.tokensIn + s.usage.cacheRead + s.usage.cacheWrite)), " tokens read"),
             s.tally.errors ? h("span", null, h("b", { style: "color:var(--oc-error-text)" }, full(s.tally.errors)), " errors") : null,
-            s.tally.compactions ? h("span", null, h("b", null, full(s.tally.compactions)), " compactions") : null,
-            s.childCount ? h("span", null, h("b", null, full(s.childCount)), " subagents") : null),
+            s.tally.compactions ? h("span", null, h("b", null, full(s.tally.compactions)), s.tally.compactions === 1 ? " compaction" : " compactions") : null,
+            s.childCount ? h("span", null, h("b", null, full(s.childCount)), s.childCount === 1 ? " subagent" : " subagents") : null),
         liveLine))
 }

@@ -325,8 +325,8 @@ main.view { padding: 14px 16px 40px; display: grid; gap: 22px; }
 /* ------------------------------------------------------- Work Status card */
 
 .status { padding: 10px 12px 12px; display: grid; gap: 8px; font-size: var(--fs-sm); }
-.status-top { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
-.status-top b { font-size: var(--fs-md); font-weight: 650; }
+.status-top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 2px 10px; }
+.status-top > b { font-size: var(--fs-md); font-weight: 650; white-space: nowrap; }
 .status-ctx { font-variant-numeric: tabular-nums; color: var(--text-2); white-space: nowrap; }
 .status-ctx b { color: var(--oc-fg); font-size: var(--fs-md); }
 .status-line { display: flex; flex-wrap: wrap; gap: 2px 12px; color: var(--text-2); }
