@@ -80,7 +80,11 @@ Matching-sample deduplication does not use a stable step ID and can merge identi
 - **Compatible context-mode v1 stores.** The readers target the session/content/stat formats
   present in upstream **1.0.169** (the latest stable v1 observed on 2026-10-30). Compatibility
   depends on the stored tables and fields, not the word “v1” alone. Older formats are not all
-  certified. **The context-mode v2 engine rewrite is not supported.** Keep v1 data if upgrading.
+  certified.
+- **context-mode v2 stores (read-only, partial).** Project DBs at
+  `~/.context-mode/projects/<key>/context.db` (checked against v2.2.0) are found automatically
+  and read as both session events and knowledge bases. v2 records no token counts and no
+  run-stat files, so Runs and per-step usage curves stay empty; model steps are counted.
 - **SQLite in OpenChamber's service runtime** for Sessions, Knowledge and optional OpenCode
   metadata. The reader uses `node:sqlite` with read-only and busy-timeout options: use
   **Node 22.16+ on the 22.x line, or Node 24+**, with that module enabled. Node 22.5 introduced
@@ -100,7 +104,7 @@ V1/V2**, and **OpenChamber extension API v1**. They are not interchangeable.
 | New events from OpenCode V1 | Its working stock v1 capture plugin can supply them. | No author-specific fix required. |
 | New native events from **OpenCode V2** | Upstream 1.0.169's native plugin does not supply the V2 setup/hooks API. A compatible V2 adapter is needed. | Depends on your capture integration; this extension does not install that adapter. |
 | Per-completed-step usage/context curves | Requires a producer that records per-step usage; message-update samples are not an exact substitute. | The author's local V2 adapter adds native step-ended capture, but is not a prerequisite for basic v1 readers. |
-| context-mode **engine v2** databases | No: locations, tables and accounting changed. | A separate reader migration is needed; a host-V2 adapter does not make these stores compatible. |
+| context-mode **engine v2** databases | Not needed: v2 project DBs are read directly (sessions, timelines, insights, knowledge). | No. Runs and token usage are absent because v2 does not record them. |
 
 Models, titles, agents and parent/subagent links additionally depend on optional columns in
 OpenCode's database. Missing usage is not reconstructed from host totals. No custom OpenCode

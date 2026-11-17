@@ -5,7 +5,7 @@
  */
 
 import * as path from "node:path"
-import { discover, usedPaths } from "./discover.ts"
+import { dbHash, discover, usedPaths } from "./discover.ts"
 import { EventIndex, addTypes, emptyTally, emptyUsage, mergeUsage, promptSize, stepAt, stepCount, typeGroup } from "./events.ts"
 import type { SessionAgg } from "./events.ts"
 import { KnowledgeStore } from "./knowledge.ts"
@@ -448,7 +448,7 @@ export class Engine {
         }
 
         const runs = this.runs.read(ctx.statsDirs).filter((r) => r.startedAt <= row.lastEventAt && (r.alive ? Date.now() : r.updatedAt) >= row.startedAt)
-        const hash = path.basename(agg.dbFile, ".db").split("__")[0]
+        const hash = dbHash(agg.dbFile)
         const kb = this.knowledgeDbs(ctx).find((k) => k.summary.hash === hash)?.summary ?? null
         return {
             ok: true,

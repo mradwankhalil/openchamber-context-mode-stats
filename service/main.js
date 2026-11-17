@@ -1,8 +1,5 @@
 // service/main.ts
 import http from "node:http";
-import * as path8 from "node:path";
-
-// service/engine.ts
 import * as path7 from "node:path";
 
 // service/discover.ts
@@ -12,6 +9,64 @@ import * as path from "node:path";
 
 // service/sqlite.ts
 import { createRequire } from "node:module";
+
+// service/v2.ts
+var V2_DB_NAME = "context.db";
+var V2_PROJECT_DIR_RE = /^[0-9a-f]{16}$/i;
+var TIME = "strftime('%Y-%m-%d %H:%M:%f', e.created_at / 1000.0, 'unixepoch')";
+var SESSION_EVENTS_VIEW = `
+CREATE TEMP VIEW session_events AS
+SELECT e.seq AS id,
+       e.session_id,
+       CASE e.kind
+           WHEN 'prompt' THEN 'user_prompt'
+           WHEN 'edit' THEN 'file_edit'
+           WHEN 'toolerr' THEN 'error_tool'
+           WHEN 'decision' THEN 'decision'
+           WHEN 'cost' THEN 'agent_usage'
+           WHEN 'index' THEN 'index'
+           WHEN 'cmd' THEN CASE WHEN e.tool = 'Bash' THEN 'env' ELSE 'tool_call' END
+           ELSE e.kind
+       END AS type,
+       e.kind AS category,
+       0 AS priority,
+       CASE
+           WHEN e.kind = 'cost' THEN 'tokens_in:0 tokens_out:0'
+           WHEN e.kind IN ('edit', 'index') THEN coalesce(e.path, e.key, e.body, '')
+           WHEN e.kind = 'cmd' AND e.tool = 'Bash' AND e.key LIKE 'Bash:%' THEN substr(e.key, 6)
+           WHEN e.kind = 'cmd' THEN coalesce(e.tool, '')
+           ELSE coalesce(e.body, '')
+       END AS data,
+       e.worktree AS project_dir,
+       ${TIME} AS created_at,
+       max(0, coalesce(e.sandbox_bytes, 0) - coalesce(e.returned_bytes, 0)) AS bytes_avoided,
+       coalesce(e.returned_bytes, 0) AS bytes_returned
+FROM main.events e`;
+var SOURCES_VIEW = `
+CREATE TEMP VIEW sources AS
+SELECT s.id,
+       s.label,
+       coalesce(s.chunk_count, 0) AS chunk_count,
+       0 AS code_chunk_count,
+       strftime('%Y-%m-%d %H:%M:%f', s.created_ts / 1000.0, 'unixepoch') AS indexed_at,
+       CASE WHEN s.kind = 'path' THEN s.label END AS file_path
+FROM main.sources s`;
+function mainColumns(db, table) {
+  return new Set(db.prepare(`PRAGMA main.table_info("${table}")`).all().map((r) => String(r.name)));
+}
+function isV2(db) {
+  const cols = mainColumns(db, "events");
+  return cols.has("kind") && cols.has("sandbox_bytes") && cols.has("returned_bytes") && mainColumns(db, "session_events").size === 0;
+}
+function adaptV2(db) {
+  if (!isV2(db))
+    return;
+  db.exec(SESSION_EVENTS_VIEW);
+  if (mainColumns(db, "sources").has("created_ts"))
+    db.exec(SOURCES_VIEW);
+}
+
+// service/sqlite.ts
 var ctor = null;
 var loadError;
 var attempted = false;
@@ -36,7 +91,11 @@ function openReadonly(file) {
   const Database = load();
   if (!Database)
     throw new Error(`node:sqlite is unavailable: ${loadError ?? "unknown"}`);
-  return new Database(file, { readOnly: true, timeout: 2000 });
+  const db = new Database(file, { readOnly: true, timeout: 2000 });
+  try {
+    adaptV2(db);
+  } catch {}
+  return db;
 }
 function withDb(file, fn) {
   const db = openReadonly(file);
@@ -49,7 +108,7 @@ function withDb(file, fn) {
   }
 }
 function tableNames(db) {
-  return new Set(db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','view')").all().map((r) => String(r.name)));
+  return new Set(db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','view') UNION SELECT name FROM sqlite_temp_master WHERE type = 'view'").all().map((r) => String(r.name)));
 }
 function columnNames(db, table) {
   return new Set(db.prepare(`PRAGMA table_info("${table.replace(/"/g, "")}")`).all().map((r) => String(r.name)));
@@ -134,23 +193,46 @@ function dedupe(list) {
     return true;
   });
 }
-function scanDir(dir, re) {
+function v2ProjectsDir(home = os.homedir()) {
+  return path.join(home, ".context-mode", "projects");
+}
+function dbHash(file) {
+  const name = path.basename(file);
+  if (name === V2_DB_NAME)
+    return path.basename(path.dirname(file));
+  return name.replace(/\.db$/, "").split("__")[0];
+}
+function listStoreFiles(dir, re, v2 = false) {
   let entries;
   try {
-    entries = fs.readdirSync(dir);
+    entries = fs.readdirSync(dir, { withFileTypes: true });
   } catch {
-    return { exists: false, files: 0, bytes: 0, newestMs: 0 };
+    return null;
   }
+  const files = [];
+  for (const e of entries) {
+    if (re.test(e.name) || v2 && e.name === V2_DB_NAME && !e.isDirectory())
+      files.push(path.join(dir, e.name));
+    else if (v2 && V2_PROJECT_DIR_RE.test(e.name) && e.isDirectory()) {
+      const f = path.join(dir, e.name, V2_DB_NAME);
+      if (fs.statSync(f, { throwIfNoEntry: false })?.isFile())
+        files.push(f);
+    }
+  }
+  return files;
+}
+function scanDir(dir, re, v2 = false) {
+  const list = listStoreFiles(dir, re, v2);
+  if (!list)
+    return { exists: false, files: 0, bytes: 0, newestMs: 0 };
   let files = 0, bytes = 0, newestMs = 0;
-  for (const name of entries) {
-    if (!re.test(name))
-      continue;
+  for (const file of list) {
     files++;
     try {
-      const st = fs.statSync(path.join(dir, name));
+      const st = fs.statSync(file);
       bytes += st.size;
       newestMs = Math.max(newestMs, st.mtimeMs);
-      const wal = fs.statSync(path.join(dir, name + "-wal"), { throwIfNoEntry: false });
+      const wal = fs.statSync(file + "-wal", { throwIfNoEntry: false });
       if (wal) {
         bytes += wal.size;
         newestMs = Math.max(newestMs, wal.mtimeMs);
@@ -175,7 +257,7 @@ function discover(settings, opts = {}) {
   const locations = [];
   const roots = settings.dataRoot.trim() ? [{ path: rootFromSetting(settings.dataRoot, home), origin: "data-root" }] : candidateRoots(env, home, platform);
   const add = (kind, c, re, pinned) => {
-    const s = scanDir(c.path, re);
+    const s = scanDir(c.path, re, kind !== "stats");
     locations.push({
       kind,
       path: c.path,
@@ -197,6 +279,15 @@ function discover(settings, opts = {}) {
     }
     for (const root of roots)
       add(kind, { ...root, path: path.join(root.path, "context-mode", sub) }, re, root.origin === "data-root");
+    if (kind === "stats")
+      return;
+    if (settings.dataRoot.trim()) {
+      const dir = path.join(roots[0].path, "projects");
+      if (fs.statSync(dir, { throwIfNoEntry: false })?.isDirectory())
+        add(kind, { path: dir, origin: "data-root", note: "context-mode v2" }, re, true);
+    } else {
+      add(kind, { path: v2ProjectsDir(home), origin: "auto", note: "context-mode v2" }, re, false);
+    }
   };
   pinnedOrRoots("sessions", settings.sessionDirs, "sessions", SESSION_DB_RE);
   pinnedOrRoots("stats", settings.statsDirs, "sessions", STATS_RE);
@@ -894,14 +985,14 @@ function mergeSession(parts) {
   const seen = new Set;
   const merged = [];
   const all = ordered.map((p) => p.steps);
-  for (const steps2 of all) {
-    for (let o = 0;o < steps2.length; o += STEP_STRIDE) {
-      const key = `${steps2[o]}|${steps2[o + 1]}|${steps2[o + 2]}|${steps2[o + 3]}|${steps2[o + 4]}`;
+  for (const steps of all) {
+    for (let o = 0;o < steps.length; o += STEP_STRIDE) {
+      const key = `${steps[o]}|${steps[o + 1]}|${steps[o + 2]}|${steps[o + 3]}|${steps[o + 4]}`;
       if (seen.has(key))
         continue;
       seen.add(key);
       for (let k = 0;k < STEP_STRIDE; k++)
-        merged.push(steps2[o + k]);
+        merged.push(steps[o + k]);
     }
   }
   const n = merged.length / STEP_STRIDE;
@@ -943,7 +1034,7 @@ function mergeSession(parts) {
     steps
   };
 }
-var hashOf = (file) => path4.basename(file, ".db").split("__")[0];
+var hashOf = dbHash;
 
 class EventIndex {
   dbs = new Map;
@@ -1024,17 +1115,8 @@ class EventIndex {
     if (!this.live(gen))
       return;
     const files = [];
-    for (const dir of dirs) {
-      let entries = [];
-      try {
-        entries = fs3.readdirSync(dir);
-      } catch {
-        continue;
-      }
-      for (const name of entries)
-        if (SESSION_DB_RE.test(name))
-          files.push(path4.join(dir, name));
-    }
+    for (const dir of dirs)
+      files.push(...listStoreFiles(dir, SESSION_DB_RE, true) ?? []);
     let cached = 0;
     if (!this.cacheLoaded) {
       this.cacheLoaded = true;
@@ -1218,11 +1300,11 @@ class EventIndex {
   }
 }
 function deferred() {
-  let resolve3 = () => {
+  let resolve = () => {
     return;
   };
-  const promise = new Promise((r) => resolve3 = r);
-  return { promise, resolve: resolve3 };
+  const promise = new Promise((r) => resolve = r);
+  return { promise, resolve };
 }
 
 // service/knowledge.ts
@@ -1250,16 +1332,9 @@ class KnowledgeStore {
     const out = [];
     const seen = new Set;
     for (const dir of dirs) {
-      let entries = [];
-      try {
-        entries = fs4.readdirSync(dir);
-      } catch {
-        continue;
-      }
-      for (const name of entries) {
-        if (!CONTENT_DB_RE.test(name))
+      for (const file of listStoreFiles(dir, CONTENT_DB_RE, true) ?? []) {
+        if (seen.has(file))
           continue;
-        const file = path5.join(dir, name);
         seen.add(file);
         const st = fs4.statSync(file, { throwIfNoEntry: false });
         if (!st)
@@ -1286,8 +1361,7 @@ class KnowledgeStore {
   }
 }
 function readContentDb(file, bytes) {
-  const name = path5.basename(file);
-  const hash = name.replace(/\.db$/, "").split("__")[0];
+  const hash = dbHash(file);
   return withDb(file, (db) => {
     const sources = [];
     if (tableNames(db).has("sources")) {
@@ -1433,10 +1507,10 @@ function parseRunFile(pid, raw, sourceDir) {
     return null;
   const tools = [];
   if (isRecord(raw.by_tool)) {
-    for (const [name, stat2] of Object.entries(raw.by_tool)) {
-      if (!isRecord(stat2))
+    for (const [name, stat] of Object.entries(raw.by_tool)) {
+      if (!isRecord(stat))
         continue;
-      tools.push({ name, calls: num2(stat2.calls), bytes: num2(stat2.bytes) });
+      tools.push({ name, calls: num2(stat.calls), bytes: num2(stat.bytes) });
     }
     tools.sort((a, b) => b.calls - a.calls || b.bytes - a.bytes);
   }
@@ -1996,7 +2070,7 @@ class Engine {
     let timelineTotal = 0;
     const timeline = [];
     const lists = { decisions: [], prompts: [] };
-    const counts2 = {
+    const counts = {
       files: new Map,
       errors: new Map,
       skills: new Map,
@@ -2016,10 +2090,10 @@ class Engine {
     for (const file of agg.dbFiles) {
       try {
         withDb(file, (db) => {
-          const n2 = int(db.prepare(`SELECT count(*) c FROM session_events WHERE session_id = ?${typeFilter}`).get(id, ...typeParams)?.c);
-          if (!n2)
+          const n = int(db.prepare(`SELECT count(*) c FROM session_events WHERE session_id = ?${typeFilter}`).get(id, ...typeParams)?.c);
+          if (!n)
             return;
-          timelineTotal += n2;
+          timelineTotal += n;
           for (const r of db.prepare(`SELECT id, type, category, priority, data, created_at, bytes_avoided + bytes_returned b
                          FROM session_events WHERE session_id = ?${typeFilter} ORDER BY created_at DESC, id DESC LIMIT ?`).all(id, ...typeParams, opts.offset + opts.limit)) {
             const key = `${r.type}|${r.created_at}|${str(r.data).slice(0, 200)}`;
@@ -2033,20 +2107,20 @@ class Engine {
                          GROUP BY type, d`).all(id)) {
             const type = str(r.type), d = str(r.d), c = int(r.c);
             if (type.startsWith("file_"))
-              bump(counts2.files, redactPaths ? redactPath(d) : d, c, type.slice(5));
+              bump(counts.files, redactPaths ? redactPath(d) : d, c, type.slice(5));
             else if (type === "error_tool") {
               if (showContent)
-                bump(counts2.errors, d, c);
+                bump(counts.errors, d, c);
             } else if (type === "skill")
-              bump(counts2.skills, d || "(unnamed)", c);
+              bump(counts.skills, d || "(unnamed)", c);
             else
               for (const p of d.split(/,\s*/))
-                bump(counts2.refs, p.trim(), c);
+                bump(counts.refs, p.trim(), c);
           }
-          const list2 = (types, limit) => db.prepare(`SELECT id, type, category, priority, data, created_at, 0 b FROM session_events
+          const list = (types, limit) => db.prepare(`SELECT id, type, category, priority, data, created_at, 0 b FROM session_events
                             WHERE session_id = ? AND type IN (${types.map(() => "?").join(",")}) ORDER BY created_at DESC LIMIT ?`).all(id, ...types, limit).map(toEvent);
-          lists.decisions.push(...list2(["decision", "blocker", "blocker_resolved", "constraint_discovered"], opts.topN * 2));
-          lists.prompts.push(...list2(["user_prompt"], opts.topN * 2));
+          lists.decisions.push(...list(["decision", "blocker", "blocker_resolved", "constraint_discovered"], opts.topN * 2));
+          lists.prompts.push(...list(["user_prompt"], opts.topN * 2));
           if (tableNames(db).has("session_resume")) {
             for (const r of db.prepare("SELECT created_at, event_count, consumed, snapshot FROM session_resume WHERE session_id = ? ORDER BY id").all(id)) {
               const snap = str(r.snapshot);
@@ -2063,7 +2137,7 @@ class Engine {
     }
     timeline.sort((a, b) => b.at - a.at || b.id - a.id);
     const ranked = (m) => [...m].map(([label, v]) => ({ label, count: v.count, hint: v.hint.size ? [...v.hint].join(", ") : undefined })).sort((a, b) => b.count - a.count).slice(0, opts.topN);
-    const newest = (l, n2) => l.sort((a, b) => b.at - a.at).slice(0, n2);
+    const newest = (l, n) => l.sort((a, b) => b.at - a.at).slice(0, n);
     const n = stepCount(agg.steps);
     const per = Math.max(1, Math.ceil(n / 600));
     const series = [];
@@ -2089,7 +2163,7 @@ class Engine {
         series.push(pt);
     }
     const runs = this.runs.read(ctx.statsDirs).filter((r) => r.startedAt <= row.lastEventAt && (r.alive ? Date.now() : r.updatedAt) >= row.startedAt);
-    const hash = path7.basename(agg.dbFile, ".db").split("__")[0];
+    const hash = dbHash(agg.dbFile);
     const kb = this.knowledgeDbs(ctx).find((k) => k.summary.hash === hash)?.summary ?? null;
     return {
       ok: true,
@@ -2115,10 +2189,10 @@ class Engine {
       contextDrops: drops,
       timeline: timeline.slice(opts.offset, opts.offset + opts.limit),
       timelineTotal,
-      files: ranked(counts2.files),
-      errors: ranked(counts2.errors),
-      skills: ranked(counts2.skills),
-      refs: ranked(counts2.refs),
+      files: ranked(counts.files),
+      errors: ranked(counts.errors),
+      skills: ranked(counts.skills),
+      refs: ranked(counts.refs),
       decisions: newest(lists.decisions, opts.topN * 2),
       prompts: newest(lists.prompts, opts.topN * 2),
       resumes: resumes.sort((a, b) => a.at - b.at),
@@ -2388,7 +2462,7 @@ if (!Number.isInteger(port) || port <= 0 || !token) {
   process.exit(1);
 }
 var dataDir = process.env.OPENCHAMBER_SERVICE_DATA_DIR || "";
-var engine = new Engine({ cacheDir: dataDir ? path8.join(dataDir, "event-index") : null });
+var engine = new Engine({ cacheDir: dataDir ? path7.join(dataDir, "event-index") : null });
 var MAX_BODY = 256 * 1024;
 function send(res, status, body) {
   const payload = JSON.stringify(body);
@@ -2396,7 +2470,7 @@ function send(res, status, body) {
   res.end(payload);
 }
 function readBody(req) {
-  return new Promise((resolve3, reject) => {
+  return new Promise((resolve, reject) => {
     let size = 0;
     const chunks = [];
     req.on("data", (c) => {
@@ -2410,10 +2484,10 @@ function readBody(req) {
     });
     req.on("end", () => {
       if (!chunks.length)
-        return resolve3({});
+        return resolve({});
       try {
         const v = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-        resolve3(typeof v === "object" && v !== null && !Array.isArray(v) ? v : {});
+        resolve(typeof v === "object" && v !== null && !Array.isArray(v) ? v : {});
       } catch {
         reject(new Error("invalid JSON body"));
       }

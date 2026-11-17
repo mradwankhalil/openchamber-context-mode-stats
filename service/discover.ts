@@ -6,6 +6,10 @@
  *   - run stats files     <root>/context-mode/sessions/stats-pid-<ppid>.json (the MCP server)
  *   - knowledge-base DBs  <root>/context-mode/content/<hash>.db             (the MCP server)
  *
+ * context-mode v2 replaces all three with one DB per project,
+ *   <home>/.context-mode/projects/<key>/context.db
+ * read as both a session event DB and a knowledge-base DB (see v2.ts).
+ *
  * `<root>` differs by component and OS: the plugin follows OpenCode's config
  * dir (%APPDATA%\opencode on Windows, $XDG_CONFIG_HOME/opencode elsewhere),
  * while the MCP server uses ~/.config/opencode. CONTEXT_MODE_DATA_DIR moves
@@ -18,6 +22,7 @@ import * as os from "node:os"
 import * as path from "node:path"
 import type { DiscoveredLocation, DiscoveryReport, LocationKind, LocationSettings } from "./types.ts"
 import { sqliteStatus } from "./sqlite.ts"
+import { V2_DB_NAME, V2_PROJECT_DIR_RE } from "./v2.ts"
 
 export const SESSION_DB_RE = /^[0-9a-f]{16}(?:__[0-9a-z]+)?\.db$/i
 export const STATS_RE = /^stats-pid-(.+)\.json$/
@@ -86,23 +91,53 @@ function dedupe(list: Candidate[]): Candidate[] {
     })
 }
 
-function scanDir(dir: string, re: RegExp): { exists: boolean; files: number; bytes: number; newestMs: number } {
-    let entries: string[]
+/** The v2 `projects` folder under a context-mode v2 data dir (default ~/.context-mode). */
+export function v2ProjectsDir(home = os.homedir()): string {
+    return path.join(home, ".context-mode", "projects")
+}
+
+/** Hash that names a store DB: `<hash>[__<wt>].db` (v1) or `<hash>/context.db` (v2). */
+export function dbHash(file: string): string {
+    const name = path.basename(file)
+    if (name === V2_DB_NAME) return path.basename(path.dirname(file))
+    return name.replace(/\.db$/, "").split("__")[0]
+}
+
+/**
+ * Store files in `dir` whose name matches `re`. With `v2`, also a v2 project
+ * DB in `dir` itself or one level down (`<dir>/<key>/context.db`).
+ * Returns null when `dir` cannot be read.
+ */
+export function listStoreFiles(dir: string, re: RegExp, v2 = false): string[] | null {
+    let entries: fs.Dirent[]
     try {
-        entries = fs.readdirSync(dir)
+        entries = fs.readdirSync(dir, { withFileTypes: true })
     } catch {
-        return { exists: false, files: 0, bytes: 0, newestMs: 0 }
+        return null
     }
+    const files: string[] = []
+    for (const e of entries) {
+        if (re.test(e.name) || (v2 && e.name === V2_DB_NAME && !e.isDirectory())) files.push(path.join(dir, e.name))
+        else if (v2 && V2_PROJECT_DIR_RE.test(e.name) && e.isDirectory()) {
+            const f = path.join(dir, e.name, V2_DB_NAME)
+            if (fs.statSync(f, { throwIfNoEntry: false })?.isFile()) files.push(f)
+        }
+    }
+    return files
+}
+
+function scanDir(dir: string, re: RegExp, v2 = false): { exists: boolean; files: number; bytes: number; newestMs: number } {
+    const list = listStoreFiles(dir, re, v2)
+    if (!list) return { exists: false, files: 0, bytes: 0, newestMs: 0 }
     let files = 0, bytes = 0, newestMs = 0
-    for (const name of entries) {
-        if (!re.test(name)) continue
+    for (const file of list) {
         files++
         try {
-            const st = fs.statSync(path.join(dir, name))
+            const st = fs.statSync(file)
             bytes += st.size
             newestMs = Math.max(newestMs, st.mtimeMs)
             // WAL files carry the freshest writes.
-            const wal = fs.statSync(path.join(dir, name + "-wal"), { throwIfNoEntry: false })
+            const wal = fs.statSync(file + "-wal", { throwIfNoEntry: false })
             if (wal) {
                 bytes += wal.size
                 newestMs = Math.max(newestMs, wal.mtimeMs)
@@ -138,7 +173,7 @@ export function discover(settings: LocationSettings, opts: { env?: NodeJS.Proces
         : candidateRoots(env, home, platform)
 
     const add = (kind: LocationKind, c: Candidate, re: RegExp, pinned: boolean) => {
-        const s = scanDir(c.path, re)
+        const s = scanDir(c.path, re, kind !== "stats")
         locations.push({
             kind,
             path: c.path,
@@ -159,6 +194,14 @@ export function discover(settings: LocationSettings, opts: { env?: NodeJS.Proces
             return
         }
         for (const root of roots) add(kind, { ...root, path: path.join(root.path, "context-mode", sub) }, re, root.origin === "data-root")
+        if (kind === "stats") return
+        // context-mode v2: one DB per project serves as both event and knowledge store.
+        if (settings.dataRoot.trim()) {
+            const dir = path.join(roots[0].path, "projects")
+            if (fs.statSync(dir, { throwIfNoEntry: false })?.isDirectory()) add(kind, { path: dir, origin: "data-root", note: "context-mode v2" }, re, true)
+        } else {
+            add(kind, { path: v2ProjectsDir(home), origin: "auto", note: "context-mode v2" }, re, false)
+        }
     }
 
     pinnedOrRoots("sessions", settings.sessionDirs, "sessions", SESSION_DB_RE)

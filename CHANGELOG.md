@@ -4,6 +4,14 @@ All notable changes to Context Mode for OpenChamber. Versions follow
 [semantic versioning](https://semver.org/); the version in `package.json` is the one
 OpenChamber shows in Settings → Extensions.
 
+## Unreleased
+
+### Added
+
+- **context-mode v2 stores.** Project DBs under `~/.context-mode/projects/` are found
+  automatically and shown as sessions, timelines, insights and knowledge bases. v2 records no
+  token counts or run-stat files, so Runs and usage curves stay empty for that data.
+
 ## 1.1.0 — 2026-11-17
 
 Opening the panel after a restart is now fast. Before 1.1.0 the extension's service rebuilt

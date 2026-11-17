@@ -6,7 +6,7 @@
 
 import * as fs from "node:fs"
 import * as path from "node:path"
-import { CONTENT_DB_RE } from "./discover.ts"
+import { CONTENT_DB_RE, dbHash, listStoreFiles } from "./discover.ts"
 import { int, sqliteTime, str, tableNames, withDb } from "./sqlite.ts"
 import type { KnowledgeDbSummary, KnowledgeSource } from "./types.ts"
 
@@ -39,15 +39,8 @@ export class KnowledgeStore {
         const out: KnowledgeDb[] = []
         const seen = new Set<string>()
         for (const dir of dirs) {
-            let entries: string[] = []
-            try {
-                entries = fs.readdirSync(dir)
-            } catch {
-                continue
-            }
-            for (const name of entries) {
-                if (!CONTENT_DB_RE.test(name)) continue
-                const file = path.join(dir, name)
+            for (const file of listStoreFiles(dir, CONTENT_DB_RE, true) ?? []) {
+                if (seen.has(file)) continue
                 seen.add(file)
                 const st = fs.statSync(file, { throwIfNoEntry: false })
                 if (!st) continue
@@ -72,8 +65,7 @@ export class KnowledgeStore {
 }
 
 export function readContentDb(file: string, bytes: number): KnowledgeDb {
-    const name = path.basename(file)
-    const hash = name.replace(/\.db$/, "").split("__")[0]
+    const hash = dbHash(file)
     return withDb(file, (db) => {
         const sources: KnowledgeSource[] = []
         if (tableNames(db).has("sources")) {

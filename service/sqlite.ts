@@ -7,6 +7,7 @@
  */
 
 import { createRequire } from "node:module"
+import { adaptV2 } from "./v2.ts"
 
 export interface Statement {
     all(...params: unknown[]): Record<string, unknown>[]
@@ -15,6 +16,7 @@ export interface Statement {
 
 export interface Db {
     prepare(sql: string): Statement
+    exec(sql: string): void
     close(): void
 }
 
@@ -45,7 +47,13 @@ export function sqliteStatus(): { available: boolean; error?: string } {
 export function openReadonly(file: string): Db {
     const Database = load()
     if (!Database) throw new Error(`node:sqlite is unavailable: ${loadError ?? "unknown"}`)
-    return new Database(file, { readOnly: true, timeout: 2000 })
+    const db = new Database(file, { readOnly: true, timeout: 2000 })
+    try {
+        adaptV2(db)
+    } catch {
+        // not a context-mode v2 DB, or an older SQLite; queries then see the file as it is
+    }
+    return db
 }
 
 /** Open, run `fn`, always close. */
@@ -64,7 +72,7 @@ export function withDb<T>(file: string, fn: (db: Db) => T): T {
 
 export function tableNames(db: Db): Set<string> {
     return new Set(
-        db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','view')").all()
+        db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','view') UNION SELECT name FROM sqlite_temp_master WHERE type = 'view'").all()
             .map((r) => String(r.name)),
     )
 }

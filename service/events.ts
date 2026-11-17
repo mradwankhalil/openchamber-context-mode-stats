@@ -23,7 +23,7 @@ import * as fs from "node:fs"
 import * as path from "node:path"
 import { int, sqliteTime, str, tableNames, withDb } from "./sqlite.ts"
 import type { Db } from "./sqlite.ts"
-import { SESSION_DB_RE } from "./discover.ts"
+import { SESSION_DB_RE, dbHash, listStoreFiles } from "./discover.ts"
 import { IndexCache } from "./indexcache.ts"
 import { dayKey, yieldTick } from "./util.ts"
 import type { EventTally, IndexProgress, Usage } from "./types.ts"
@@ -372,7 +372,7 @@ export interface EventIndexOptions {
     sliceMs?: number
 }
 
-const hashOf = (file: string): string => path.basename(file, ".db").split("__")[0]
+const hashOf = dbHash
 
 export class EventIndex {
     private dbs = new Map<string, DbIndex>()
@@ -462,15 +462,7 @@ export class EventIndex {
     private async run(dirs: string[], gen: number): Promise<void> {
         if (!this.live(gen)) return
         const files: string[] = []
-        for (const dir of dirs) {
-            let entries: string[] = []
-            try {
-                entries = fs.readdirSync(dir)
-            } catch {
-                continue
-            }
-            for (const name of entries) if (SESSION_DB_RE.test(name)) files.push(path.join(dir, name))
-        }
+        for (const dir of dirs) files.push(...(listStoreFiles(dir, SESSION_DB_RE, true) ?? []))
 
         let cached = 0
         if (!this.cacheLoaded) {

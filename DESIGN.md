@@ -8,7 +8,8 @@ turns them into answers, and the visual system of the panel.
 
 The readers target the formats present in upstream context-mode 1.0.169. This is the
 context-mode **v1 engine**, independently of whether OpenCode itself is V1 or V2. The
-context-mode v2 engine rewrite uses different locations/tables/accounting and is not supported.
+context-mode v2 engine rewrite uses different locations/tables/accounting; `service/v2.ts`
+presents its project DBs in the v1 shape through TEMP views (see §1a).
 The extension reads existing stores; it does not install the integration that produces them.
 
 context-mode has two halves in OpenCode, and they can write to different places.
@@ -53,6 +54,24 @@ session/stat/content folders. OpenCode enrichment selects one database, not ever
    Stock OpenCode V1 capture records message updates, not necessarily one row per model call.
    A per-step producer improves granularity; a drop after a large prompt can indicate a
    compaction, a reset, or a smaller side call.
+
+## 1a. context-mode v2 stores
+
+context-mode v2 (checked against 2.2.0) keeps one DB per project at
+`~/.context-mode/projects/<key>/context.db`, shared by every worktree, session and host.
+Discovery adds that folder for the `sessions` and `content` kinds and lists `<key>/context.db`
+one level down. When a read-only handle opens a DB with v2's `events` table, `service/v2.ts`
+creates TEMP views (the file is never written):
+
+| v1 shape | from v2 |
+|---|---|
+| `session_events.type` | `prompt`→`user_prompt`, `edit`→`file_edit`, `toolerr`→`error_tool`, `decision`, `index`, `cost`→`agent_usage`, `cmd` Bash→`env` (data = command), other `cmd`→`tool_call` (data = tool) |
+| `project_dir`, `created_at` | `worktree`; epoch ms as SQLite UTC text |
+| `bytes_avoided`, `bytes_returned` | `max(0, sandbox_bytes − returned_bytes)`, `returned_bytes` |
+| `sources` | `chunk_count`, `created_ts`→`indexed_at`, `label` as `file_path` for `path` sources |
+
+v2 records no token counts (a `cost` row only marks a model step) and writes no run-stat
+files, so Runs, usage curves and compaction counts stay empty for v2 data.
 
 ## 2. What the data supports
 
